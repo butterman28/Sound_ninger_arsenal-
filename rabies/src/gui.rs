@@ -21,6 +21,7 @@ pub struct AppState {
     stream_handle: Arc<RwLock<Option<cpal::Stream>>>,
     playback_asset: Arc<RwLock<Option<Arc<AudioAsset>>>>,
     playback_sample_index: Arc<AtomicU64>, // Track actual sample position for seeking
+    loading: Arc<AtomicBool>,  // Tracks when we're loading a sample
 }
 
 impl Default for AppState {
@@ -37,6 +38,8 @@ impl Default for AppState {
             stream_handle: Arc::new(RwLock::new(None)),
             playback_asset: Arc::new(RwLock::new(None)),
             playback_sample_index: Arc::new(AtomicU64::new(0)),
+            
+            loading: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -49,7 +52,6 @@ impl AppState {
         // Store asset for playback
         *self.playback_asset.write() = Some(asset.clone());
         self.is_playing.store(true, Ordering::Relaxed);
-        
         
         // Setup CPAL audio stream
         let host = cpal::default_host();
@@ -263,44 +265,63 @@ impl AppState {
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Rabies");
+            ui.heading("Audio Sampler");
 
             // Transport controls
             ui.horizontal(|ui| {
                 if ui.button("Load Sample").clicked() {
-                    self.stop_playback();
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Audio", &["mp3", "wav", "flac", "ogg", "m4a", "aac"])
-                        .pick_file()
-                    {
-                        let path_str = path.to_string_lossy().to_string();
-                        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                        let status = self.status.clone();
-                        let audio_manager = self.audio_manager.clone();
-                        let current_asset = self.current_asset.clone();
-                        let waveform_analysis = self.waveform_analysis.clone();
+    self.stop_playback();
+    if let Some(path) = rfd::FileDialog::new()
+        .add_filter("Audio", &["mp3", "wav", "flac", "ogg", "m4a", "aac"])
+        .pick_file()
+    {
+        let path_buf = path.clone(); // Keep PathBuf for safe file access
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let status = self.status.clone();
+        let audio_manager = self.audio_manager.clone();
+        let current_asset = self.current_asset.clone();
+        let waveform_analysis = self.waveform_analysis.clone();
+        let loading = self.loading.clone();
 
-                        *self.status.write() = format!("Loading: {}...", file_name);
+        *self.status.write() = format!("Loading: {}...", file_name);
+        loading.store(true, Ordering::Relaxed);
 
-                        thread::spawn(move || {
-                            match audio_manager.load_audio(&path_str) {
-                                Ok(asset) => {
-                                    *current_asset.write() = Some(asset.clone());
-                                    let analysis = audio_manager.analyze_waveform(&asset, 400);
-                                    *waveform_analysis.write() = Some(analysis);
-                                    let duration = asset.frames as f32 / asset.sample_rate as f32;
-                                    *status.write() = format!(
-                                        "✓ Ready: {} ({:.2}s)",
-                                        asset.file_name, duration
-                                    );
-                                }
-                                Err(e) => {
-                                    *status.write() = format!("✗ Error: {}", e);
-                                }
-                            }
-                        });
-                    }
+        // ✅ CRITICAL FIX: Catch panics to prevent app crash
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                audio_manager.load_audio(path_buf.to_str().unwrap_or(""))
+            }));
+
+            match result {
+                Ok(Ok(asset)) => {
+                    *current_asset.write() = Some(asset.clone());
+                    let analysis = audio_manager.analyze_waveform(&asset, 400);
+                    *waveform_analysis.write() = Some(analysis);
+                    let duration = asset.frames as f32 / asset.sample_rate as f32;
+                    *status.write() = format!(
+                        "✓ Ready: {} ({:.2}s)",
+                        asset.file_name, duration
+                    );
                 }
+                Ok(Err(e)) => {
+                    *status.write() = format!("✗ Load error: {}", e);
+                    eprintln!("Audio load error: {}", e);
+                }
+                Err(panic) => {
+                    // Extract panic message safely
+                    let msg = panic.downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().map(|s| s.clone()))
+                        .unwrap_or_else(|| "Unknown panic".to_string());
+                    
+                    *status.write() = format!("✗ CRASH: {}", msg);
+                    eprintln!("PANIC during audio load: {}", msg);
+                }
+            }
+            loading.store(false, Ordering::Relaxed);
+        });
+    }
+}
 
                 // Play/Pause button
                 if let Some(asset) = self.current_asset.read().as_ref() {
@@ -315,7 +336,6 @@ impl eframe::App for AppState {
 
                 if ui.button("■ Stop").clicked() {
                     self.stop_playback();
-                    // ✅ Reset position to beginning on STOP (not on pause)
                     self.playback_position.store(0.0, Ordering::Relaxed);
                     self.playback_sample_index.store(0, Ordering::Relaxed);
                     *self.status.write() = "Stopped".to_string();
@@ -356,73 +376,74 @@ impl eframe::App for AppState {
                 // Background
                 painter.rect_filled(rect, 0.0, egui::Color32::from_gray(25));
 
- if let Some(analysis) = self.waveform_analysis.read().as_ref() {
-    let center_y = rect.center().y;
-    let height_scale = rect.height() * 0.45;
-    let width = rect.width();
-    let bucket_count = analysis.min_max_buckets.len();
-    let bar_width = (width / bucket_count as f32).max(1.0);
-    
-    // Draw solid blue bars (amplitude visualization)
-    for (i, (min, max)) in analysis.min_max_buckets.iter().enumerate() {
-        let x = rect.left() + (i as f32 * bar_width);
-        let peak = max.abs().max(min.abs());
-        let bar_height = (peak * height_scale * 2.0).min(rect.height() * 0.9);
-        let bar_top = center_y - bar_height / 2.0;
-        
-        // Solid blue bar (filled rectangle)
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x, bar_top),
-                egui::pos2(x + bar_width - 0.5, bar_top + bar_height), // -0.5 prevents gaps
-            ),
-            0.0,
-            egui::Color32::from_rgb(80, 160, 255),
-        );
-    }
-    
-    // Center line
-    painter.hline(
-        rect.x_range(),
-        center_y,
-        egui::Stroke::new(0.5, egui::Color32::from_gray(60)),
-    );
-    
-    // Draw playhead
-    let progress = self.playback_position.load(Ordering::Relaxed);
-    let playhead_x = rect.left() + progress * width;
-    
-    painter.vline(
-        playhead_x,
-        rect.y_range(),
-        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 80, 80)),
-    );
-    
-    // Draw playhead triangle
-    let triangle_size = 8.0;
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            egui::pos2(playhead_x, rect.top() + triangle_size),
-            egui::pos2(playhead_x - triangle_size, rect.top()),
-            egui::pos2(playhead_x + triangle_size, rect.top()),
-        ],
-        egui::Color32::from_rgb(255, 80, 80),
-        egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
-    ));
-} else {
-    let text = if self.current_asset.read().is_none() {
-        "No sample loaded – click Load Sample"
-    } else {
-        "Analyzing waveform..."
-    };
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        egui::FontId::monospace(14.0),
-        egui::Color32::from_gray(180),
-    );
-}     
+                if let Some(analysis) = self.waveform_analysis.read().as_ref() {
+                    let center_y = rect.center().y;
+                    let height_scale = rect.height() * 0.45;
+                    let width = rect.width();
+                    let bucket_count = analysis.min_max_buckets.len();
+                    let bar_width = (width / bucket_count as f32).max(1.0);
+                    
+                    // Draw solid blue bars (amplitude visualization)
+                    for (i, (min, max)) in analysis.min_max_buckets.iter().enumerate() {
+                        let x = rect.left() + (i as f32 * bar_width);
+                        let peak = max.abs().max(min.abs());
+                        let bar_height = (peak * height_scale * 2.0).min(rect.height() * 0.9);
+                        let bar_top = center_y - bar_height / 2.0;
+                        
+                        // Solid blue bar (filled rectangle)
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x, bar_top),
+                                egui::pos2(x + bar_width - 0.5, bar_top + bar_height), // -0.5 prevents gaps
+                            ),
+                            0.0,
+                            egui::Color32::from_rgb(80, 160, 255),
+                        );
+                    }
+                    
+                    // Center line
+                    painter.hline(
+                        rect.x_range(),
+                        center_y,
+                        egui::Stroke::new(0.5, egui::Color32::from_gray(60)),
+                    );
+                    
+                    // Draw playhead
+                    let progress = self.playback_position.load(Ordering::Relaxed);
+                    let playhead_x = rect.left() + progress * width;
+                    
+                    painter.vline(
+                        playhead_x,
+                        rect.y_range(),
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 80, 80)),
+                    );
+                    
+                    // Draw playhead triangle
+                    let triangle_size = 8.0;
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(playhead_x, rect.top() + triangle_size),
+                            egui::pos2(playhead_x - triangle_size, rect.top()),
+                            egui::pos2(playhead_x + triangle_size, rect.top()),
+                        ],
+                        egui::Color32::from_rgb(255, 80, 80),
+                        egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
+                    ));
+                } else {
+                    let text = if self.current_asset.read().is_none() {
+                        "No sample loaded – click Load Sample"
+                    } else {
+                        "Analyzing waveform..."
+                    };
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        text,
+                        egui::FontId::monospace(14.0),
+                        egui::Color32::from_gray(180),
+                    );
+                }
+                
                 // Handle click/drag to seek
                 if response.dragged() || response.clicked() {
                     let pos = ui.input(|i| i.pointer.hover_pos());
@@ -458,6 +479,48 @@ impl eframe::App for AppState {
         // Auto-pause when asset is cleared
         if self.current_asset.read().is_none() && self.is_playing.load(Ordering::Relaxed) {
             self.stop_playback();
+        }
+
+        // ✅ LOADING OVERLAY (spinner + darkened background)
+        if self.loading.load(Ordering::Relaxed) {
+            let screen_rect = ctx.screen_rect();
+            
+            // Darken background
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("loading_overlay")));
+            painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(180));
+            
+            // Centered loading dialog
+            let center = screen_rect.center();
+            let dialog_size = egui::vec2(240.0, 100.0);
+            let dialog_rect = egui::Rect::from_center_size(center, dialog_size);
+            
+            // Dialog background
+            painter.rect_filled(dialog_rect, 12.0, egui::Color32::from_gray(30));
+            
+            // Spinner animation (simple rotating dots)
+            let time = ctx.input(|i| i.time) as f32;
+                let radius = 20.0;
+                let dot_count = 8;
+
+                for i in 0..dot_count {
+                    let angle = time * 3.0 + (i as f32 * std::f32::consts::TAU / dot_count as f32);
+                    let offset = egui::vec2(angle.cos(), angle.sin()) * radius;
+                    let pos = egui::pos2(center.x + offset.x, center.y + offset.y - 10.0);
+                    
+                    // ✅ FIXED: Calculate alpha safely in f32 BEFORE casting to u8
+                    let alpha = (((i as f32 / dot_count as f32) * 155.0) + 100.0).min(255.0) as u8;
+                    
+                    painter.circle_filled(pos, 6.0, egui::Color32::from_rgba_unmultiplied(80, 160, 255, alpha));
+                }
+                            
+            // Loading text
+            painter.text(
+                egui::pos2(center.x, center.y + 25.0),
+                egui::Align2::CENTER_TOP,
+                "Loading sample...",
+                egui::FontId::proportional(16.0),
+                egui::Color32::WHITE,
+            );
         }
 
         ctx.request_repaint_after(Duration::from_millis(16));

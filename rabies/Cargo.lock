@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "Rabies"
+version = "0.1.0"
+dependencies = [
+ "atomic_float",
+ "cpal",
+ "eframe",
+ "egui",
+ "parking_lot",
+ "rfd",
+ "symphonia",
+]
+
+[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -528,19 +541,6 @@ dependencies = [
  "atspi-common",
  "serde",
  "zbus 3.15.2",
-]
-
-[[package]]
-name = "audio-sampler-plugin"
-version = "0.1.0"
-dependencies = [
- "atomic_float",
- "cpal",
- "eframe",
- "egui",
- "parking_lot",
- "rfd",
- "symphonia",
 ]
 
 [[package]]
