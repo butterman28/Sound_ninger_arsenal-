@@ -1,5 +1,6 @@
 mod audio;
 mod gui;
+mod samples;
 
 use eframe::egui;
 
