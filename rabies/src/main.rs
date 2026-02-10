@@ -9,8 +9,8 @@ fn main() -> Result<(), eframe::Error> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([700.0, 580.0])  // Slightly taller for new controls
-            .with_min_inner_size([400.0, 400.0])
+            .with_inner_size([700.0, 720.0])  // Taller for MPC-style pad grid
+            .with_min_inner_size([400.0, 500.0])
             .with_title("Audio Sampler"),
         ..Default::default()
     };

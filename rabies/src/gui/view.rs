@@ -1,305 +1,10 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
-use std::time::Duration;
 use eframe::egui;
-use parking_lot::RwLock;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SizedSample, FromSample};
-use atomic_float::AtomicF32;
-use crate::audio::{AudioAsset, AudioManager, WaveformAnalysis};
-use crate::samples::{SamplesManager, PlaybackMode};
+use std::time::Duration;
+use std::sync::atomic::Ordering;
 
-pub struct AppState {
-    pub audio_manager: Arc<AudioManager>,
-    pub samples_manager: Arc<SamplesManager>,
-    pub current_asset: Arc<RwLock<Option<Arc<AudioAsset>>>>,
-    pub waveform_analysis: Arc<RwLock<Option<WaveformAnalysis>>>,
-    pub status: Arc<RwLock<String>>,
-    
-    // Playback state
-    playback_position: Arc<AtomicF32>,
-    is_playing: Arc<AtomicBool>,
-    stream_handle: Arc<RwLock<Option<cpal::Stream>>>,
-    playback_asset: Arc<RwLock<Option<Arc<AudioAsset>>>>,
-    playback_sample_index: Arc<AtomicU64>,
-    loading: Arc<AtomicBool>,
-    dragged_mark_index: Arc<RwLock<Option<usize>>>,
-    
-    // ✅ NEW: UI state for region selection
-    selected_from_marker: Arc<RwLock<Option<usize>>>,
-    selected_to_marker: Arc<RwLock<Option<usize>>>,
-}
+use super::AppState;
+use crate::samples::PlaybackMode;
 
-impl Default for AppState {
-    fn default() -> Self {
-        Self {
-            audio_manager: Arc::new(AudioManager::new()),
-            samples_manager: Arc::new(SamplesManager::new()),
-            current_asset: Arc::new(RwLock::new(None)),
-            waveform_analysis: Arc::new(RwLock::new(None)),
-            status: Arc::new(RwLock::new("Click Load Sample to begin".to_string())),
-            
-            playback_position: Arc::new(AtomicF32::new(0.0)),
-            is_playing: Arc::new(AtomicBool::new(false)),
-            stream_handle: Arc::new(RwLock::new(None)),
-            playback_asset: Arc::new(RwLock::new(None)),
-            playback_sample_index: Arc::new(AtomicU64::new(0)),
-            loading: Arc::new(AtomicBool::new(false)),
-            dragged_mark_index: Arc::new(RwLock::new(None)),
-            
-            selected_from_marker: Arc::new(RwLock::new(None)),
-            selected_to_marker: Arc::new(RwLock::new(None)),
-        }
-    }
-}
-
-impl AppState {
-    fn start_playback(&self, asset: Arc<AudioAsset>) {
-        // Stop existing playback
-        self.stop_playback();
-        
-        // Store asset for playback
-        *self.playback_asset.write() = Some(asset.clone());
-        self.is_playing.store(true, Ordering::Relaxed);
-        
-        // Setup CPAL audio stream
-        let host = cpal::default_host();
-        let device = match host.default_output_device() {
-            Some(d) => d,
-            None => {
-                *self.status.write() = "Error: No audio output device found".to_string();
-                self.is_playing.store(false, Ordering::Relaxed);
-                return;
-            }
-        };
-        
-        let config = match device.default_output_config() {
-            Ok(c) => c,
-            Err(e) => {
-                *self.status.write() = format!("Error getting audio config: {}", e);
-                self.is_playing.store(false, Ordering::Relaxed);
-                return;
-            }
-        };
-        
-        let sample_rate = asset.sample_rate;
-        let channels = asset.channels;
-        let pcm = asset.pcm.clone();
-        let position = self.playback_position.clone();
-        let sample_index = self.playback_sample_index.clone();
-        let is_playing = self.is_playing.clone();
-        let status = self.status.clone();
-        let total_samples = pcm.len() as u64;
-        
-        // ✅ NEW: Clone samples_manager for playback stopping logic
-        let samples_manager = self.samples_manager.clone();
-        let sample_name = asset.file_name.clone();
-        
-        // Create stream based on sample format
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => self.build_stream::<f32>(
-                &device, &config.into(), sample_rate, channels, pcm, position, sample_index, 
-                is_playing, total_samples, status, samples_manager, sample_name
-            ),
-            cpal::SampleFormat::I16 => self.build_stream::<i16>(
-                &device, &config.into(), sample_rate, channels, pcm, position, sample_index, 
-                is_playing, total_samples, status, samples_manager, sample_name
-            ),
-            cpal::SampleFormat::U16 => self.build_stream::<u16>(
-                &device, &config.into(), sample_rate, channels, pcm, position, sample_index, 
-                is_playing, total_samples, status, samples_manager, sample_name
-            ),
-            _ => {
-                *self.status.write() = format!("Unsupported sample format: {:?}", config.sample_format());
-                self.is_playing.store(false, Ordering::Relaxed);
-                return;
-            }
-        };
-        
-        match stream {
-            Ok(s) => {
-                if let Err(e) = s.play() {
-                    *self.status.write() = format!("Error starting playback: {}", e);
-                    self.is_playing.store(false, Ordering::Relaxed);
-                } else {
-                    *self.stream_handle.write() = Some(s);
-                    
-                    // ✅ Update status based on playback mode
-                    let mode_text = match self.samples_manager.get_playback_mode() {
-                        PlaybackMode::PlayToEnd => "to end".to_string(),
-                        PlaybackMode::PlayToNextMarker => "to next marker".to_string(),
-                        PlaybackMode::CustomRegion { from, to } => format!("region {} → {}", from, to),
-                    };
-                    *self.status.write() = format!("Playing: {} ({})", asset.file_name, mode_text);
-                }
-            }
-            Err(e) => {
-                *self.status.write() = format!("Error creating audio stream: {}", e);
-                self.is_playing.store(false, Ordering::Relaxed);
-            }
-        }
-    }
-    
-    fn build_stream<T: cpal::Sample + SizedSample + FromSample<f32>>(
-        &self,
-        device: &cpal::Device,
-        config: &cpal::StreamConfig,
-        _sample_rate: u32,
-        channels: u16,
-        pcm: Vec<f32>,
-        position: Arc<AtomicF32>,
-        sample_index: Arc<AtomicU64>,
-        is_playing: Arc<AtomicBool>,
-        total_samples: u64,
-        status: Arc<RwLock<String>>,
-        samples_manager: Arc<SamplesManager>,  // ✅ NEW
-        sample_name: String,  // ✅ NEW
-    ) -> Result<cpal::Stream, cpal::BuildStreamError> 
-    {
-        let channels_count = channels as usize;
-        
-        let err_status = status.clone();
-        let err_is_playing = is_playing.clone();
-        
-        let err_fn = move |err| {
-            eprintln!("Audio error: {}", err);
-            *err_status.write() = format!("Playback error: {}", err);
-            err_is_playing.store(false, Ordering::Relaxed);
-        };
-        
-        let data_status = status.clone();
-        let data_is_playing = is_playing.clone();
-        let data_position = position.clone();
-        let data_sample_index = sample_index.clone();
-        let data_pcm = pcm.clone();
-        
-        let stream = device.build_output_stream(
-            config,
-            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                if !data_is_playing.load(Ordering::Relaxed) {
-                    for d in data.iter_mut() {
-                        *d = T::from_sample(0.0f32);
-                    }
-                    return;
-                }
-                
-                let mut current_sample = data_sample_index.load(Ordering::Relaxed) as usize;
-                let frames_needed = data.len() / channels_count;
-                let mut sample_index_pos = 0;
-                
-                // ✅ NEW: Get target stop position if playback mode requires it
-                let current_pos = if total_samples > 0 {
-                    current_sample as f32 / total_samples as f32
-                } else {
-                    0.0
-                };
-                
-                // ✅ NEW: Check if we should stop at a marker
-                if samples_manager.should_stop_at(current_pos, &sample_name) {
-                    data_is_playing.store(false, Ordering::Relaxed);
-                    *data_status.write() = "Stopped at marker".to_string();
-                    for d in data.iter_mut() {
-                        *d = T::from_sample(0.0f32);
-                    }
-                    return;
-                }
-                
-                for _ in 0..frames_needed {
-                    for ch in 0..channels_count {
-                        let sample_value = if current_sample + ch < data_pcm.len() {
-                            data_pcm[current_sample + ch]
-                        } else {
-                            0.0
-                        };
-                        
-                        data[sample_index_pos] = T::from_sample(sample_value);
-                        sample_index_pos += 1;
-                    }
-                    
-                    current_sample = current_sample.saturating_add(channels_count);
-                    
-                    if current_sample >= data_pcm.len() {
-                        data_is_playing.store(false, Ordering::Relaxed);
-                        *data_status.write() = "Playback finished".to_string();
-                        break;
-                    }
-                }
-                
-                if total_samples > 0 {
-                    let progress = current_sample as f32 / total_samples as f32;
-                    data_position.store(progress.min(1.0), Ordering::Relaxed);
-                }
-                
-                data_sample_index.store(current_sample as u64, Ordering::Relaxed);
-                
-                for d in data.iter_mut().skip(sample_index_pos) {
-                    *d = T::from_sample(0.0f32);
-                }
-            },
-            err_fn,
-            None,
-        )?;
-        
-        Ok(stream)
-    }
-    
-    fn stop_playback(&self) {
-        self.is_playing.store(false, Ordering::Relaxed);
-        *self.stream_handle.write() = None;
-        *self.playback_asset.write() = None;
-    }
-    
-    fn toggle_playback(&self) {
-        if let Some(asset) = self.current_asset.read().clone() {
-            if self.is_playing.load(Ordering::Relaxed) {
-                self.is_playing.store(false, Ordering::Relaxed);
-                *self.status.write() = format!("Paused: {}", asset.file_name);
-            } else {
-                // ✅ NEW: For custom regions, start from the "from" marker
-                if let PlaybackMode::CustomRegion { from, .. } = self.samples_manager.get_playback_mode() {
-                    if let Some(mark) = self.samples_manager.get_mark_by_id(from) {
-                        self.playback_position.store(mark.position, Ordering::Relaxed);
-                        let total_samples = asset.pcm.len();
-                        let new_sample_pos = (mark.position as f64 * total_samples as f64) as usize;
-                        self.playback_sample_index.store(new_sample_pos as u64, Ordering::Relaxed);
-                    }
-                } else if self.playback_position.load(Ordering::Relaxed) >= 0.999 {
-                    // If we're at the end, restart from beginning
-                    self.playback_position.store(0.0, Ordering::Relaxed);
-                    self.playback_sample_index.store(0, Ordering::Relaxed);
-                }
-                self.start_playback(asset);
-            }
-        }
-    }
-    
-    fn seek_to(&self, normalized_pos: f32) {
-        if let Some(asset) = self.current_asset.read().as_ref() {
-            let was_playing = self.is_playing.load(Ordering::Relaxed);
-            self.is_playing.store(false, Ordering::Relaxed);
-            
-            let total_samples = asset.pcm.len();
-            let new_sample_pos = (normalized_pos as f64 * total_samples as f64) as usize;
-            let clamped_pos = new_sample_pos.min(total_samples);
-            
-            self.playback_position.store(normalized_pos, Ordering::Relaxed);
-            self.playback_sample_index.store(clamped_pos as u64, Ordering::Relaxed);
-            
-            let duration = asset.frames as f32 / asset.sample_rate as f32;
-            let current_time = normalized_pos * duration;
-            *self.status.write() = format!(
-                "Seeked to {:.2}s / {:.2}s",
-                current_time,
-                duration
-            );
-            
-            if was_playing {
-                self.start_playback(asset.clone());
-            }
-        }
-    }
-}
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -666,24 +371,36 @@ impl eframe::App for AppState {
                 });
             }
 
-            // Sample marks browser
+            // ✅ MPC-STYLE SAMPLE PADS GRID
             ui.add_space(12.0);
-            ui.collapsing("Sample Marks", |ui| {
-                let marks = self.samples_manager.get_marks();
-                
-                if marks.is_empty() {
-                    ui.label(egui::RichText::new("No marks yet").italics().color(egui::Color32::GRAY));
-                    ui.label("While playing, press 'M' to mark current position");
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} marks", marks.len()));
-                        if ui.button("Clear All").clicked() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Sample Pads").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Clear All").clicked() {
                             self.samples_manager.clear_marks();
                         }
                     });
+                });
+                
+                ui.add_space(4.0);
+                
+                let marks = self.samples_manager.get_marks();
+                
+                if marks.is_empty() {
+                    ui.label(egui::RichText::new("No pads yet").italics().color(egui::Color32::GRAY));
+                    ui.label("Press 'M' while playing to create pads");
+                } else {
+                    // ✅ GRID LAYOUT: 4 columns
+                    let cols = 4;
+                    let pad_size = egui::vec2(
+                        (ui.available_width() - (cols as f32 - 1.0) * 8.0) / cols as f32,
+                        60.0
+                    );
                     
-                    egui::ScrollArea::vertical()
-                        .max_height(150.0)
+                    egui::Grid::new("sample_pads_grid")
+                        .spacing([8.0, 8.0])
+                        .min_col_width(pad_size.x)
                         .show(ui, |ui| {
                             for (idx, mark) in marks.iter().enumerate() {
                                 let duration = if let Some(asset) = self.current_asset.read().as_ref() {
@@ -693,34 +410,118 @@ impl eframe::App for AppState {
                                 };
                                 let time_at_mark = mark.position * duration;
                                 
-                                ui.horizontal(|ui| {
-                                    let label = format!(
-                                        "#{} - {}  ({:.2}s)",
-                                        mark.id,
-                                        mark.sample_name,
-                                        time_at_mark
-                                    );
-                                    
-                                    let is_active = self.current_asset.read()
-                                        .as_ref()
-                                        .map(|a| a.file_name == mark.sample_name)
-                                        .unwrap_or(false);
-                                    
-                                    if ui.button(
-                                        egui::RichText::new(label).color(if is_active { 
-                                            egui::Color32::from_rgb(80, 160, 255) 
-                                        } else { 
-                                            egui::Color32::WHITE 
-                                        })
-                                    ).clicked() {
-                                        self.seek_to(mark.position);
-                                        *self.status.write() = format!("Jumped to mark #{}: {:.2}s", mark.id, time_at_mark);
+                                let is_active = self.current_asset.read()
+                                    .as_ref()
+                                    .map(|a| a.file_name == mark.sample_name)
+                                    .unwrap_or(false);
+                                
+                                let is_currently_playing = self.is_playing.load(Ordering::Relaxed) 
+                                    && is_active
+                                    && {
+                                        let current_pos = self.playback_position.load(Ordering::Relaxed);
+                                        (current_pos - mark.position).abs() < 0.05 // Within 5% of position
+                                    };
+                                
+                                // ✅ MPC-STYLE PAD
+                                let (rect, response) = ui.allocate_exact_size(
+                                    pad_size,
+                                    egui::Sense::click()
+                                );
+                                
+                                // Determine pad color
+                                let base_color = if is_currently_playing {
+                                    egui::Color32::from_rgb(255, 140, 0) // Orange when playing from this pad
+                                } else if is_active {
+                                    egui::Color32::from_rgb(60, 140, 220) // Blue if sample loaded
+                                } else {
+                                    egui::Color32::from_rgb(40, 40, 45) // Dark gray if sample not loaded
+                                };
+                                
+                                let color = if response.hovered() {
+                                    egui::Color32::from_rgb(
+                                        (base_color.r() as f32 * 1.3).min(255.0) as u8,
+                                        (base_color.g() as f32 * 1.3).min(255.0) as u8,
+                                        (base_color.b() as f32 * 1.3).min(255.0) as u8,
+                                    )
+                                } else {
+                                    base_color
+                                };
+                                
+                                // Draw pad background
+                                ui.painter().rect_filled(
+                                    rect,
+                                    4.0,
+                                    color,
+                                );
+                                
+                                // Draw border
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    4.0,
+                                    egui::Stroke::new(
+                                        if is_currently_playing { 3.0 } else { 1.0 },
+                                        if is_currently_playing {
+                                            egui::Color32::from_rgb(255, 200, 100)
+                                        } else {
+                                            egui::Color32::from_rgb(80, 80, 85)
+                                        }
+                                    ),
+                                );
+                                
+                                // Draw pad ID (big number)
+                                ui.painter().text(
+                                    rect.center() - egui::vec2(0.0, 8.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{}", mark.id),
+                                    egui::FontId::proportional(24.0),
+                                    egui::Color32::WHITE,
+                                );
+                                
+                                // Draw time info (small text)
+                                ui.painter().text(
+                                    rect.center() + egui::vec2(0.0, 12.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{:.2}s", time_at_mark),
+                                    egui::FontId::proportional(10.0),
+                                    egui::Color32::from_gray(200),
+                                );
+                                
+                                // ✅ TRIGGER PLAYBACK ON CLICK
+                                if response.clicked() {
+                                    if let Some(asset) = self.current_asset.read().clone() {
+                                        // Seek to marker position
+                                        self.playback_position.store(mark.position, Ordering::Relaxed);
+                                        let total_samples = asset.pcm.len();
+                                        let new_sample_pos = (mark.position as f64 * total_samples as f64) as usize;
+                                        self.playback_sample_index.store(new_sample_pos as u64, Ordering::Relaxed);
+                                        
+                                        // Start playback immediately
+                                        self.start_playback(asset);
+                                        
+                                        *self.status.write() = format!("Playing from pad #{} ({:.2}s)", mark.id, time_at_mark);
                                     }
-                                    
-                                    if ui.small_button("✖").clicked() {
-                                        self.samples_manager.delete_mark(idx);
-                                    }
-                                });
+                                }
+                                
+                                // Right-click to delete
+                                if response.secondary_clicked() {
+                                    self.samples_manager.delete_mark(idx);
+                                }
+                                
+                                // Show tooltip on hover
+                                if response.hovered() {
+                                    egui::show_tooltip_at_pointer(ui.ctx(), egui::Id::new(format!("pad_tooltip_{}", idx)), |ui| {
+                                        ui.label(format!("Pad #{}", mark.id));
+                                        ui.label(format!("Sample: {}", mark.sample_name));
+                                        ui.label(format!("Time: {:.2}s", time_at_mark));
+                                        ui.label(egui::RichText::new("Left-click: Play").small());
+                                        ui.label(egui::RichText::new("Right-click: Delete").small());
+                                    });
+                                }
+                                
+                                // Start new row every 4 pads
+                                if (idx + 1) % cols == 0 {
+                                    ui.end_row();
+                                }
                             }
                         });
                 }

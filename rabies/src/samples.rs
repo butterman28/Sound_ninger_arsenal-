@@ -112,13 +112,19 @@ impl SamplesManager {
         let mode = self.playback_mode.read().clone();
         let marks = self.get_marks_for_sample(sample_name);
         
+        // ✅ FIXED: Add minimum distance threshold to avoid immediate stops
+        // 0.005 = 0.5% of file length
+        // For a 60s file: 0.5% = 300ms minimum distance
+        // For a 10s file: 0.5% = 50ms minimum distance
+        const MIN_DISTANCE: f32 = 0.005;
+        
         match mode {
             PlaybackMode::PlayToEnd => None,  // Play until the end
             PlaybackMode::PlayToNextMarker => {
-                // Find the next marker after current position
+                // Find the next marker that is meaningfully ahead
                 marks
                     .iter()
-                    .filter(|m| m.position > current_pos)
+                    .filter(|m| m.position > current_pos + MIN_DISTANCE)
                     .min_by(|a, b| a.position.partial_cmp(&b.position).unwrap())
                     .map(|m| m.position)
             }
