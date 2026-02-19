@@ -94,76 +94,134 @@ impl eframe::App for AppState {
             ui.label(self.status.read().as_str());
 
             // Playback Region Controls
-            if let Some(asset) = self.current_asset.read().as_ref() {
-                let marks = self.samples_manager.get_marks_for_sample(&asset.file_name);
-                
-                if !marks.is_empty() {
-                    ui.add_space(8.0);
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new("Playback Mode").strong());
-                        
-                        let current_mode = self.samples_manager.get_playback_mode();
-                        
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(
-                                matches!(current_mode, PlaybackMode::PlayToEnd),
-                                "Play to End"
-                            ).clicked() {
-                                self.samples_manager.set_playback_mode(PlaybackMode::PlayToEnd);
-                            }
-                            
-                            if ui.selectable_label(
-                                matches!(current_mode, PlaybackMode::PlayToNextMarker),
-                                "Play to Next Marker"
-                            ).clicked() {
-                                self.samples_manager.set_playback_mode(PlaybackMode::PlayToNextMarker);
-                            }
-                        });
-                        
-                        ui.add_space(4.0);
-                        ui.label("Custom Region:");
-                        ui.horizontal(|ui| {
-                            ui.label("From:");
-                            
-                            let mut selected_from = self.selected_from_marker.write();
-                            egui::ComboBox::from_id_source("from_marker")
-                                .selected_text(
-                                    selected_from
-                                        .map(|id| format!("Marker {}", id))
-                                        .unwrap_or_else(|| "Select...".to_string())
-                                )
-                                .show_ui(ui, |ui| {
-                                    for mark in &marks {
-                                        ui.selectable_value(&mut *selected_from, Some(mark.id), format!("Marker {}", mark.id));
-                                    }
-                                });
-                            
-                            ui.label("To:");
-                            
-                            let mut selected_to = self.selected_to_marker.write();
-                            egui::ComboBox::from_id_source("to_marker")
-                                .selected_text(
-                                    selected_to
-                                        .map(|id| format!("Marker {}", id))
-                                        .unwrap_or_else(|| "Select...".to_string())
-                                )
-                                .show_ui(ui, |ui| {
-                                    for mark in &marks {
-                                        ui.selectable_value(&mut *selected_to, Some(mark.id), format!("Marker {}", mark.id));
-                                    }
-                                });
-                            
-                            let can_set_region = selected_from.is_some() && selected_to.is_some();
-                            if ui.add_enabled(can_set_region, egui::Button::new("Set Region")).clicked() {
-                                if let (Some(from), Some(to)) = (*selected_from, *selected_to) {
-                                    self.samples_manager.set_playback_mode(PlaybackMode::CustomRegion { from, to });
-                                    *self.status.write() = format!("Region set: {} → {}", from, to);
-                                }
-                            }
-                        });
-                    });
+            // ✅ UPDATED SECTION - Replace the "Playback Region Controls" section in view.rs with this:
+
+// ========== START: REPLACE THIS SECTION ==========
+// Playback Region Controls with Multiple Region Management
+if let Some(asset) = self.current_asset.read().as_ref() {
+    let marks = self.samples_manager.get_marks_for_sample(&asset.file_name);
+    
+    if !marks.is_empty() {
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Playback Mode").strong());
+            
+            let current_mode = self.samples_manager.get_playback_mode();
+            
+            // Basic playback modes
+            ui.horizontal(|ui| {
+                if ui.selectable_label(
+                    matches!(current_mode, PlaybackMode::PlayToEnd),
+                    "Play to End"
+                ).clicked() {
+                    self.samples_manager.set_playback_mode(PlaybackMode::PlayToEnd);
                 }
+                
+                if ui.selectable_label(
+                    matches!(current_mode, PlaybackMode::PlayToNextMarker),
+                    "Play to Next Marker"
+                ).clicked() {
+                    self.samples_manager.set_playback_mode(PlaybackMode::PlayToNextMarker);
+                }
+            });
+            
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            
+            // ✅ NEW: Region Management Section
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Custom Regions").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Create new region button
+                    let selected_from = self.selected_from_marker.read();
+                    let selected_to = self.selected_to_marker.read();
+                    let can_create = selected_from.is_some() && selected_to.is_some();
+                    
+                    if ui.add_enabled(can_create, egui::Button::new("➕ Create Region")).clicked() {
+                        if let (Some(from), Some(to)) = (*selected_from, *selected_to) {
+                            let region_id = self.samples_manager.create_region(from, to);
+                            self.samples_manager.set_playback_mode(PlaybackMode::CustomRegion { region_id });
+                            *self.status.write() = format!("✓ Region created: {} → {}", from, to);
+                        }
+                    }
+                });
+            });
+            
+            // Marker selection for creating new regions
+            ui.horizontal(|ui| {
+                ui.label("From:");
+                
+                let mut selected_from = self.selected_from_marker.write();
+                egui::ComboBox::from_id_source("from_marker")
+                    .selected_text(
+                        selected_from
+                            .map(|id| format!("Marker {}", id))
+                            .unwrap_or_else(|| "Select...".to_string())
+                    )
+                    .show_ui(ui, |ui| {
+                        for mark in &marks {
+                            ui.selectable_value(&mut *selected_from, Some(mark.id), format!("Marker {}", mark.id));
+                        }
+                    });
+                
+                ui.label("To:");
+                
+                let mut selected_to = self.selected_to_marker.write();
+                egui::ComboBox::from_id_source("to_marker")
+                    .selected_text(
+                        selected_to
+                            .map(|id| format!("Marker {}", id))
+                            .unwrap_or_else(|| "Select...".to_string())
+                    )
+                    .show_ui(ui, |ui| {
+                        for mark in &marks {
+                            ui.selectable_value(&mut *selected_to, Some(mark.id), format!("Marker {}", mark.id));
+                        }
+                    });
+            });
+            
+            ui.add_space(4.0);
+            
+            // ✅ NEW: List of existing regions
+            let regions = self.samples_manager.get_regions();
+            
+            if !regions.is_empty() {
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Existing Regions:").weak());
+                ui.add_space(2.0);
+                
+                egui::ScrollArea::vertical()
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for region in &regions {
+                            ui.horizontal(|ui| {
+                                // Selectable button to activate this region
+                                let is_active = matches!(current_mode, PlaybackMode::CustomRegion { region_id } if region_id == region.id);
+                                
+                                if ui.selectable_label(is_active, &region.name).clicked() {
+                                    self.samples_manager.set_playback_mode(PlaybackMode::CustomRegion { region_id: region.id });
+                                    *self.status.write() = format!("Active region: {}", region.name);
+                                }
+                                
+                                // Delete button
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("🗑").clicked() {
+                                        self.samples_manager.delete_region(region.id);
+                                        *self.status.write() = format!("Deleted region: {}", region.name);
+                                    }
+                                });
+                            });
+                        }
+                    });
+            } else {
+                ui.label(egui::RichText::new("No regions yet - select markers and click Create").italics().weak());
             }
+        });
+    }
+}
+// ========== END: REPLACE THIS SECTION ==========
 
             // Sample info panel
             if let Some(asset) = self.current_asset.read().as_ref() {

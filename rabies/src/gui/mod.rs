@@ -1,8 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
-use std::time::Duration;
-use eframe::egui;
 use parking_lot::RwLock;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SizedSample, FromSample};
@@ -66,7 +63,7 @@ impl AppState {
         *self.playback_asset.write() = Some(asset.clone());
 
         // ================================
-        // ✅ COMPUTE STOP TARGET ONCE
+        // COMPUTE STOP TARGET ONCE
         // ================================
         let start_pos = self.playback_position.load(Ordering::Relaxed);
 
@@ -79,12 +76,25 @@ impl AppState {
                     .unwrap_or(-1.0)
             }
 
-            PlaybackMode::CustomRegion { from: _, to } => {
-                self.samples_manager
-                    .get_mark_by_id(to)
-                    .map(|m| m.position)
-                    .unwrap_or(-1.0)
+            PlaybackMode::CustomRegion { region_id } => {
+                // ✅ UPDATED: Get region by ID, then get the "to" marker position
+                if let Some(region) = self.samples_manager.get_region_by_id(region_id) {
+                    self.samples_manager
+                        .get_mark_by_id(region.to)
+                        .map(|m| m.position)
+                        .unwrap_or(-1.0)
+                } else {
+                    -1.0
+                }
             }
+        };
+
+        // If start position is already at or past the stop target,
+        // ignore the region boundary and play to end instead.
+        let stop_target = if stop_target >= 0.0 && start_pos >= stop_target {
+            -1.0
+        } else {
+            stop_target
         };
 
         self.playback_stop_target
@@ -122,7 +132,7 @@ impl AppState {
         let status = self.status.clone();
         let total_samples = pcm.len() as u64;
 
-        // ✅ Pass fixed stop target to audio thread
+        // Pass fixed stop target to audio thread
         let stop_target_atomic = self.playback_stop_target.clone();
 
         let stream = match config.sample_format() {
@@ -184,7 +194,13 @@ impl AppState {
                     let mode_text = match self.samples_manager.get_playback_mode() {
                         PlaybackMode::PlayToEnd => "to end".to_string(),
                         PlaybackMode::PlayToNextMarker => "to next marker".to_string(),
-                        PlaybackMode::CustomRegion { from, to } => format!("region {} → {}", from, to),
+                        PlaybackMode::CustomRegion { region_id } => {
+                            if let Some(region) = self.samples_manager.get_region_by_id(region_id) {
+                                region.name.clone()
+                            } else {
+                                "region".to_string()
+                            }
+                        }
                     };
 
                     *self.status.write() =
@@ -211,7 +227,7 @@ impl AppState {
         is_playing: Arc<AtomicBool>,
         total_samples: u64,
         status: Arc<RwLock<String>>,
-        stop_target: Arc<AtomicF32>,  // ✅ FIXED: Use pre-computed stop target
+        stop_target: Arc<AtomicF32>,
     ) -> Result<cpal::Stream, cpal::BuildStreamError> 
     {
         let channels_count = channels as usize;
@@ -230,7 +246,7 @@ impl AppState {
         let data_position = position.clone();
         let data_sample_index = sample_index.clone();
         let data_pcm = pcm.clone();
-        let data_stop_target = stop_target.clone();  // ✅ Clone for audio callback
+        let data_stop_target = stop_target.clone();
         
         let stream = device.build_output_stream(
             config,
@@ -246,10 +262,8 @@ impl AppState {
                 let frames_needed = data.len() / channels_count;
                 let mut sample_index_pos = 0;
                 
-                // ✅ FIXED: Get the pre-computed stop target
                 let stop_position = data_stop_target.load(Ordering::Relaxed);
                 
-                // Calculate target sample index if we have a valid stop position
                 let target_sample = if stop_position >= 0.0 {
                     Some((stop_position * total_samples as f32) as usize)
                 } else {
@@ -257,7 +271,6 @@ impl AppState {
                 };
                 
                 for _ in 0..frames_needed {
-                    // ✅ FIXED: Check if we've reached the target marker
                     if let Some(target) = target_sample {
                         if current_sample >= target {
                             data_is_playing.store(false, Ordering::Relaxed);
@@ -293,7 +306,6 @@ impl AppState {
                 
                 data_sample_index.store(current_sample as u64, Ordering::Relaxed);
                 
-                // Zero-fill remaining buffer
                 for d in data.iter_mut().skip(sample_index_pos) {
                     *d = T::from_sample(0.0f32);
                 }
@@ -318,15 +330,16 @@ impl AppState {
                 *self.status.write() = format!("Paused: {}", asset.file_name);
             } else {
                 // For custom regions, start from the "from" marker
-                if let PlaybackMode::CustomRegion { from, .. } = self.samples_manager.get_playback_mode() {
-                    if let Some(mark) = self.samples_manager.get_mark_by_id(from) {
-                        self.playback_position.store(mark.position, Ordering::Relaxed);
-                        let total_samples = asset.pcm.len();
-                        let new_sample_pos = (mark.position as f64 * total_samples as f64) as usize;
-                        self.playback_sample_index.store(new_sample_pos as u64, Ordering::Relaxed);
+                if let PlaybackMode::CustomRegion { region_id } = self.samples_manager.get_playback_mode() {
+                    if let Some(region) = self.samples_manager.get_region_by_id(region_id) {
+                        if let Some(mark) = self.samples_manager.get_mark_by_id(region.from) {
+                            self.playback_position.store(mark.position, Ordering::Relaxed);
+                            let total_samples = asset.pcm.len();
+                            let new_sample_pos = (mark.position as f64 * total_samples as f64) as usize;
+                            self.playback_sample_index.store(new_sample_pos as u64, Ordering::Relaxed);
+                        }
                     }
                 } else if self.playback_position.load(Ordering::Relaxed) >= 0.999 {
-                    // If we're at the end, restart from beginning
                     self.playback_position.store(0.0, Ordering::Relaxed);
                     self.playback_sample_index.store(0, Ordering::Relaxed);
                 }
