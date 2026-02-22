@@ -7,16 +7,9 @@ use cpal::{SizedSample, FromSample};
 use atomic_float::AtomicF32;
 use crate::audio::{AudioAsset, AudioManager, WaveformAnalysis};
 use crate::samples::{SamplesManager, PlaybackMode};
+use crate::adsr::{ADSREnvelope, Voice};  // ADD THIS
 
 pub const NUM_STEPS: usize = 16;
-
-#[derive(Clone)]
-pub struct VoiceEvent {
-    pub pcm: Arc<Vec<f32>>,
-    pub channels: usize,
-    pub start_frame: usize,
-    pub speed: f32,
-}
 
 /// One independently-loaded sample as a sequencer row.
 pub struct DrumTrack {
@@ -24,11 +17,18 @@ pub struct DrumTrack {
     pub waveform: Option<WaveformAnalysis>,
     pub steps: [bool; NUM_STEPS],
     pub muted: bool,
+    pub adsr: ADSREnvelope,  // ADD THIS
 }
 
 impl DrumTrack {
     pub fn new(asset: Arc<AudioAsset>, waveform: Option<WaveformAnalysis>) -> Self {
-        Self { asset, waveform, steps: [false; NUM_STEPS], muted: false }
+        Self { 
+            asset, 
+            waveform, 
+            steps: [false; NUM_STEPS], 
+            muted: false,
+            adsr: ADSREnvelope::default(),  // ADD THIS
+        }
     }
 }
 
@@ -44,7 +44,6 @@ pub struct AppState {
     pub current_asset: Arc<RwLock<Option<Arc<AudioAsset>>>>,
     pub waveform_analysis: Arc<RwLock<Option<WaveformAnalysis>>>,
     pub status: Arc<RwLock<String>>,
-
     pub(crate) playback_position: Arc<AtomicF32>,
     pub(crate) is_playing: Arc<AtomicBool>,
     pub(crate) stream_handle: Arc<RwLock<Option<cpal::Stream>>>,
@@ -55,25 +54,22 @@ pub struct AppState {
     pub(crate) dragged_mark_index: Arc<RwLock<Option<usize>>>,
     pub(crate) selected_from_marker: Arc<RwLock<Option<usize>>>,
     pub(crate) selected_to_marker: Arc<RwLock<Option<usize>>>,
-
     // Chop sequencer grid (pads on main sample)
     pub seq_grid: Arc<RwLock<Vec<Vec<usize>>>>,
-
+    // ADSR for each chop (indexed by pad_idx)
+    pub chop_adsr: Arc<RwLock<Vec<ADSREnvelope>>>,  // ADD THIS
     // Multi-sample drum tracks
     pub drum_tracks: Arc<RwLock<Vec<DrumTrack>>>,
     pub drum_loading: Arc<AtomicBool>,
-
     // Sequencer engine
     pub seq_bpm: Arc<AtomicF32>,
     pub seq_playing: Arc<AtomicBool>,
     pub seq_current_step: Arc<RwLock<usize>>,
     pub seq_last_step_time: Arc<RwLock<Option<Instant>>>,
     pub(crate) seq_stream_handle: Arc<RwLock<Option<cpal::Stream>>>,
-    pub(crate) seq_voice_queue: Arc<std::sync::Mutex<Vec<VoiceEvent>>>,
-
+    pub(crate) seq_voice_queue: Arc<std::sync::Mutex<Vec<Voice>>>,  // CHANGED to Voice
     // Which asset the waveform display shows
     pub waveform_focus: Arc<RwLock<WaveformFocus>>,
-
     pub piano_roll_open: Arc<RwLock<bool>>,
 }
 
@@ -96,6 +92,7 @@ impl Default for AppState {
             selected_from_marker: Arc::new(RwLock::new(None)),
             selected_to_marker: Arc::new(RwLock::new(None)),
             seq_grid: Arc::new(RwLock::new(vec![Vec::new(); NUM_STEPS])),
+            chop_adsr: Arc::new(RwLock::new(Vec::new())),  // ADD THIS
             drum_tracks: Arc::new(RwLock::new(Vec::new())),
             drum_loading: Arc::new(AtomicBool::new(false)),
             seq_bpm: Arc::new(AtomicF32::new(120.0)),
@@ -109,7 +106,6 @@ impl Default for AppState {
         }
     }
 }
-
 impl AppState {
     pub fn start_playback(&self, asset: Arc<AudioAsset>) {
         self.stop_playback();
@@ -205,18 +201,15 @@ impl AppState {
     // ─────────────────────────────────────────────────────────
     pub fn tick_sequencer(&self) {
         if !self.seq_playing.load(Ordering::Relaxed) { return; }
-
         let bpm = self.seq_bpm.load(Ordering::Relaxed);
         let step_dur = std::time::Duration::from_secs_f64(60.0 / bpm as f64 / 4.0);
         let now = Instant::now();
         let should_advance = { let last = self.seq_last_step_time.read(); last.map_or(true, |t| now.duration_since(t) >= step_dur) };
         if !should_advance { return; }
-
         *self.seq_last_step_time.write() = Some(now);
         let step = { let mut s = self.seq_current_step.write(); let cur = *s; *s = (cur + 1) % NUM_STEPS; cur };
-
-        let mut events: Vec<VoiceEvent> = Vec::new();
-
+        let mut voices: Vec<Voice> = Vec::new();
+        
         // Chop pad events
         if let Some(asset) = self.current_asset.read().clone() {
             let active_pads = self.seq_grid.read()[step].clone();
@@ -225,35 +218,37 @@ impl AppState {
                 let channels = asset.channels as usize;
                 let total_frames = asset.pcm.len() / channels.max(1);
                 let pcm = Arc::new(asset.pcm.clone());
+                let chop_adsr = self.chop_adsr.read();
                 for pad_idx in active_pads {
                     if let Some(mark) = marks.get(pad_idx) {
                         if mark.sample_name != asset.file_name { continue; }
                         let start_frame = (mark.position as f64 * total_frames as f64) as usize;
-                        events.push(VoiceEvent { pcm: pcm.clone(), channels, start_frame, speed: 1.0 });
+                        let adsr = chop_adsr.get(pad_idx).copied().unwrap_or_default();
+                        voices.push(Voice::new(pcm.clone(), channels, start_frame, 1.0, adsr));
                     }
                 }
             }
         }
-
+        
         // Drum track events
         {
             let tracks = self.drum_tracks.read();
             for track in tracks.iter() {
                 if !track.muted && track.steps[step] {
                     let channels = track.asset.channels as usize;
-                    events.push(VoiceEvent {
-                        pcm: Arc::new(track.asset.pcm.clone()),
+                    voices.push(Voice::new(
+                        Arc::new(track.asset.pcm.clone()),
                         channels,
-                        start_frame: 0,
-                        speed: 1.0,
-                    });
+                        0,
+                        1.0,
+                        track.adsr,
+                    ));
                 }
             }
         }
-
-        if events.is_empty() { return; }
+        if voices.is_empty() { return; }
         self.ensure_seq_stream();
-        self.seq_voice_queue.lock().unwrap().extend(events);
+        self.seq_voice_queue.lock().unwrap().extend(voices);
     }
 
     fn ensure_seq_stream(&self) {
@@ -263,44 +258,39 @@ impl AppState {
         let config = match device.default_output_config() { Ok(c) => c, Err(_) => return };
         let cfg: cpal::StreamConfig = config.into();
         let out_channels = cfg.channels as usize;
+        let sample_rate = cfg.sample_rate.0 as f32;
         let seq_playing = self.seq_playing.clone();
         let voice_queue = self.seq_voice_queue.clone();
-
         let stream = device.build_output_stream(
             &cfg,
             {
-                let mut voices: Vec<VoiceState> = Vec::with_capacity(24);
+                let mut voices: Vec<Voice> = Vec::with_capacity(24);
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     {
                         let mut q = voice_queue.lock().unwrap();
                         for ev in q.drain(..) {
                             if voices.len() >= 16 { voices.remove(0); }
-                            voices.push(VoiceState { frame_pos: ev.start_frame as f64, speed: ev.speed, src_channels: ev.channels.max(1), pcm: ev.pcm });
+                            voices.push(ev);
                         }
                     }
                     for s in data.iter_mut() { *s = 0.0; }
-                    if !seq_playing.load(Ordering::Relaxed) { voices.clear(); return; }
+                    if !seq_playing.load(Ordering::Relaxed) { 
+                        for v in voices.iter_mut() { v.release(); }
+                    }
                     let out_frames = data.len() / out_channels.max(1);
                     for voice in voices.iter_mut() {
-                        let src_ch = voice.src_channels;
-                        let pcm_frames = voice.pcm.len() / src_ch;
                         for f in 0..out_frames {
-                            let i0 = voice.frame_pos as usize;
-                            if i0 >= pcm_frames.saturating_sub(1) { break; }
-                            let i1 = (i0 + 1).min(pcm_frames - 1);
-                            let t = (voice.frame_pos - i0 as f64) as f32;
-                            for oc in 0..out_channels {
-                                let sc = oc.min(src_ch - 1);
-                                let s0 = voice.pcm.get(i0 * src_ch + sc).copied().unwrap_or(0.0);
-                                let s1 = voice.pcm.get(i1 * src_ch + sc).copied().unwrap_or(0.0);
-                                let smp = s0 + t * (s1 - s0);
-                                let oi = f * out_channels + oc;
-                                if oi < data.len() { data[oi] = (data[oi] + smp).clamp(-1.0, 1.0); }
+                            if let Some(samples) = voice.render(sample_rate, out_channels) {
+                                for (oc, smp) in samples.iter().enumerate() {
+                                    let oi = f * out_channels + oc;
+                                    if oi < data.len() {
+                                        data[oi] = (data[oi] + smp).clamp(-1.0, 1.0);
+                                    }
+                                }
                             }
-                            voice.frame_pos += voice.speed as f64;
                         }
                     }
-                    voices.retain(|v| (v.frame_pos as usize) < (v.pcm.len() / v.src_channels).saturating_sub(1));
+                    voices.retain(|v| !v.is_finished());
                 }
             },
             |err| eprintln!("Seq stream error: {}", err),

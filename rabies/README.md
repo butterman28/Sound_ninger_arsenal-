@@ -9,3 +9,6 @@ press m to chop the tracks , by ui/ux that looked like the best spot
 ├─────┼─────┼─────┼─────┤
 │  Z  │  X  │  C  │  V  │  ← Pads 13-16
 └─────┴─────┴─────┴─────┘
+
+
+## FOR,BY & OF THE UNDERDOG

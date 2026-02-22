@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 use super::{AppState, WaveformFocus, DrumTrack, NUM_STEPS};
 use crate::samples::PlaybackMode;
+use crate::adsr::ADSREnvelope;
 
 const PAD_COLORS: &[(u8, u8, u8)] = &[
     (80, 160, 255), (80, 220, 140), (240, 160, 60), (200, 80, 200),
@@ -19,23 +20,110 @@ fn pad_color_dim(idx: usize) -> egui::Color32 {
     let (r, g, b) = PAD_COLORS[idx % PAD_COLORS.len()];
     egui::Color32::from_rgb(r / 5, g / 5, b / 5)
 }
+fn drum_color(idx: usize) -> egui::Color32 { pad_color(idx + 4) }
+fn drum_color_dim(idx: usize) -> egui::Color32 { pad_color_dim(idx + 4) }
 
-// Drum track rows start at a color offset so they don't clash with chop colors
-fn drum_color(idx: usize) -> egui::Color32 {
-    pad_color(idx + 4)
+// ─────────────────────────────────────────────────────────────
+//  Knob painter helper
+//  Draws a circular knob at `center` with radius `r`.
+//  value is 0..=1 normalized. Returns true if value changed.
+//  arc goes from 7 o'clock (225°) to 5 o'clock (315°) clockwise.
+// ─────────────────────────────────────────────────────────────
+fn draw_knob(
+    painter: &egui::Painter,
+    ui: &mut egui::Ui,
+    center: egui::Pos2,
+    radius: f32,
+    value: &mut f32,   // normalized 0..=1
+    color: egui::Color32,
+    label: &str,
+    id: egui::Id,
+) -> bool {
+    use std::f32::consts::PI;
+
+    let start_angle = PI * 0.75;   // 135° = 7-o'clock
+    let end_angle   = PI * 2.25;   // 405° = 5-o'clock  (270° sweep)
+    let sweep       = end_angle - start_angle;
+
+    // track area
+    let rect = egui::Rect::from_center_size(center, egui::vec2(radius * 2.2, radius * 2.2));
+    let resp = ui.interact(rect, id, egui::Sense::click_and_drag());
+
+    // drag interaction
+    let mut changed = false;
+    if resp.dragged() {
+        let delta = resp.drag_delta();
+        let change = (-delta.y / 80.0).clamp(-1.0, 1.0);
+        *value = (*value + change).clamp(0.0, 1.0);
+        changed = true;
+    }
+    if resp.double_clicked() {
+        *value = 0.5;
+        changed = true;
+    }
+
+    // background circle
+    let bg = egui::Color32::from_rgb(28, 28, 38);
+    let ring = egui::Color32::from_gray(45);
+    painter.circle_filled(center, radius, bg);
+    painter.circle_stroke(center, radius, egui::Stroke::new(1.5, ring));
+
+    // arc track (dim)
+    let n_seg = 32;
+    for i in 0..n_seg {
+        let t0 = start_angle + (i as f32 / n_seg as f32) * sweep;
+        let t1 = start_angle + ((i + 1) as f32 / n_seg as f32) * sweep;
+        let p0 = center + egui::vec2(t0.cos(), t0.sin()) * (radius - 2.5);
+        let p1 = center + egui::vec2(t1.cos(), t1.sin()) * (radius - 2.5);
+        painter.line_segment([p0, p1], egui::Stroke::new(2.0, egui::Color32::from_gray(55)));
+    }
+
+    // arc fill (colored)
+    let fill_segs = ((*value * n_seg as f32) as usize).min(n_seg);
+    for i in 0..fill_segs {
+        let t0 = start_angle + (i as f32 / n_seg as f32) * sweep;
+        let t1 = start_angle + ((i + 1) as f32 / n_seg as f32) * sweep;
+        let p0 = center + egui::vec2(t0.cos(), t0.sin()) * (radius - 2.5);
+        let p1 = center + egui::vec2(t1.cos(), t1.sin()) * (radius - 2.5);
+        painter.line_segment([p0, p1], egui::Stroke::new(2.5, color));
+    }
+
+    // indicator line
+    let angle = start_angle + *value * sweep;
+    let inner = center + egui::vec2(angle.cos(), angle.sin()) * (radius * 0.35);
+    let outer = center + egui::vec2(angle.cos(), angle.sin()) * (radius * 0.82);
+    painter.line_segment([inner, outer], egui::Stroke::new(2.0, egui::Color32::WHITE));
+
+    // label below
+    painter.text(
+        egui::pos2(center.x, center.y + radius + 4.0),
+        egui::Align2::CENTER_TOP,
+        label,
+        egui::FontId::proportional(8.5),
+        egui::Color32::from_gray(120),
+    );
+
+    // hover highlight
+    if resp.hovered() {
+        painter.circle_stroke(center, radius, egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(255,255,255,60)));
+    }
+
+    changed
 }
-fn drum_color_dim(idx: usize) -> egui::Color32 {
-    pad_color_dim(idx + 4)
-}
+
+// src/gui/view.rs
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_sequencer();
         self.draw_piano_roll(ctx);
-
+        
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Audio Sampler");
+            // --- ADD SCROLL AREA START ---
+            egui::ScrollArea::vertical().show(ui, |ui| {
+            // --- ADD SCROLL AREA END ---
 
+            ui.heading("Audio Sampler");
             // ── Transport ─────────────────────────────────────
             ui.horizontal(|ui| {
                 if ui.button("Load Sample").clicked() {
@@ -79,7 +167,6 @@ impl eframe::App for AppState {
                         });
                     }
                 }
-
                 if self.current_asset.read().is_some() {
                     let is_playing = self.is_playing.load(Ordering::Relaxed);
                     if ui.button(if is_playing { "⏸ Pause" } else { "▶ Play" }).clicked() { self.toggle_playback(); }
@@ -100,10 +187,8 @@ impl eframe::App for AppState {
                     *self.status.write() = "Ready. Load an audio sample to begin".to_string();
                 }
             });
-
             ui.add_space(6.0);
             ui.label(self.status.read().as_str());
-
             // ── Playback Region Controls ──────────────────────
             if let Some(asset) = self.current_asset.read().as_ref() {
                 let marks = self.samples_manager.get_marks_for_sample(&asset.file_name);
@@ -166,7 +251,6 @@ impl eframe::App for AppState {
                     });
                 }
             }
-
             // ── Sample Info ───────────────────────────────────
             if let Some(asset) = self.current_asset.read().as_ref() {
                 ui.add_space(4.0);
@@ -176,15 +260,7 @@ impl eframe::App for AppState {
                         asset.sample_rate, asset.channels, asset.frames as f32 / asset.sample_rate as f32));
                 });
             }
-
-            // ──────────────────────────────────────────────────
-            //  WAVEFORM DISPLAY
-            //  Shows whichever row/track is currently focused.
-            //  Clicking a sequencer row label changes the focus.
-            // ──────────────────────────────────────────────────
             ui.add_space(8.0);
-
-            // Focus banner
             let focus = self.waveform_focus.read().clone();
             let focus_label = match &focus {
                 WaveformFocus::MainSample => {
@@ -199,7 +275,6 @@ impl eframe::App for AppState {
                         .unwrap_or("Waveform".to_string())
                 }
             };
-
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&focus_label).small().color(egui::Color32::from_gray(170)));
@@ -212,27 +287,21 @@ impl eframe::App for AppState {
                     }
                 });
                 ui.add_space(2.0);
-
                 let size = egui::Vec2::new(ui.available_width(), 150.0);
                 let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
                 let rect = response.rect;
                 painter.rect_filled(rect, 0.0, egui::Color32::from_gray(22));
-
                 let (focused_asset, focused_waveform) = self.focused_display();
-
                 if let Some(analysis) = focused_waveform.as_ref() {
                     let cy = rect.center().y;
                     let hs = rect.height() * 0.45;
                     let w = rect.width();
                     let bc = analysis.min_max_buckets.len();
                     let bw = (w / bc as f32).max(1.0);
-
-                    // Waveform color based on focus
                     let wave_color = match &focus {
                         WaveformFocus::MainSample => egui::Color32::from_rgb(80, 160, 255),
                         WaveformFocus::DrumTrack(idx) => drum_color(*idx),
                     };
-
                     for (i, (min, max)) in analysis.min_max_buckets.iter().enumerate() {
                         let x = rect.left() + i as f32 * bw;
                         let peak = max.abs().max(min.abs());
@@ -244,8 +313,6 @@ impl eframe::App for AppState {
                         );
                     }
                     painter.hline(rect.x_range(), cy, egui::Stroke::new(0.5, egui::Color32::from_gray(55)));
-
-                    // Draw chop markers only when showing main sample
                     if matches!(focus, WaveformFocus::MainSample) {
                         if let Some(asset) = self.current_asset.read().as_ref() {
                             let marks = self.samples_manager.get_marks();
@@ -266,8 +333,6 @@ impl eframe::App for AppState {
                             }
                         }
                     }
-
-                    // Playhead (only on main sample)
                     if matches!(focus, WaveformFocus::MainSample) {
                         let prog = self.playback_position.load(Ordering::Relaxed);
                         let px = rect.left() + prog * w;
@@ -278,8 +343,6 @@ impl eframe::App for AppState {
                             egui::Color32::from_rgb(255, 80, 80), egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
                         ));
                     }
-
-                    // Marker dragging (main sample only)
                     if matches!(focus, WaveformFocus::MainSample) {
                         if let Some(asset) = self.current_asset.read().as_ref() {
                             let mut dragged_index = self.dragged_mark_index.write();
@@ -304,8 +367,6 @@ impl eframe::App for AppState {
                             }
                         }
                     }
-
-                    // Click to seek (main sample only)
                     if matches!(focus, WaveformFocus::MainSample) && self.dragged_mark_index.read().is_none() {
                         if response.dragged() || response.clicked() {
                             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -324,8 +385,7 @@ impl eframe::App for AppState {
                         egui::FontId::monospace(13.0), egui::Color32::from_gray(160));
                 }
             });
-
-            // ── Seek slider (main sample only) ────────────────
+            // ── Seek slider ───────────────────────────────────
             if matches!(focus, WaveformFocus::MainSample) {
                 if let Some(asset) = self.current_asset.read().as_ref() {
                     ui.add_space(4.0);
@@ -338,7 +398,6 @@ impl eframe::App for AppState {
                     });
                 }
             }
-
             // ── Sample Pads ───────────────────────────────────
             ui.add_space(8.0);
             ui.group(|ui| {
@@ -385,75 +444,74 @@ impl eframe::App for AppState {
                     });
                 }
             });
-
             // ── Step Sequencer ────────────────────────────────
             let asset_opt = self.current_asset.read().clone();
             if let Some(asset) = asset_opt {
                 ui.add_space(8.0);
                 self.draw_step_sequencer(ui, &asset);
             } else if !self.drum_tracks.read().is_empty() {
-                // Still show sequencer even if no main sample, for drum tracks
                 ui.add_space(8.0);
                 self.draw_step_sequencer_drums_only(ui);
             }
-        }); // CentralPanel
-
-        // ── Global shortcuts ──────────────────────────────────
-        if self.current_asset.read().is_none() && self.is_playing.load(Ordering::Relaxed) {
-            self.stop_playback();
-        }
-        if self.is_playing.load(Ordering::Relaxed) {
-            if ctx.input(|i| i.key_pressed(egui::Key::M)) {
-                if let Some(asset) = self.current_asset.read().as_ref() {
-                    let pos = self.playback_position.load(Ordering::Relaxed);
-                    self.samples_manager.mark_current_position(&asset.file_name, &asset.file_name, pos);
-                    let dur = asset.frames as f32 / asset.sample_rate as f32;
-                    *self.status.write() = format!("✓ Marked at {:.2}s", pos * dur);
+            
+            // ── Global shortcuts ──────────────────────────────────
+            if self.current_asset.read().is_none() && self.is_playing.load(Ordering::Relaxed) {
+                self.stop_playback();
+            }
+            if self.is_playing.load(Ordering::Relaxed) {
+                if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+                    if let Some(asset) = self.current_asset.read().as_ref() {
+                        let pos = self.playback_position.load(Ordering::Relaxed);
+                        self.samples_manager.mark_current_position(&asset.file_name, &asset.file_name, pos);
+                        let dur = asset.frames as f32 / asset.sample_rate as f32;
+                        *self.status.write() = format!("✓ Marked at {:.2}s", pos * dur);
+                    }
                 }
             }
-        }
-
-        let key_pad: Vec<(egui::Key, usize)> = vec![
-            (egui::Key::Num1,0),(egui::Key::Num2,1),(egui::Key::Num3,2),(egui::Key::Num4,3),
-            (egui::Key::Q,4),(egui::Key::W,5),(egui::Key::E,6),(egui::Key::R,7),
-            (egui::Key::A,8),(egui::Key::S,9),(egui::Key::D,10),(egui::Key::F,11),
-            (egui::Key::Z,12),(egui::Key::X,13),(egui::Key::C,14),(egui::Key::V,15),
-        ];
-        let marks = self.samples_manager.get_marks();
-        for (key, pidx) in key_pad {
-            if ctx.input(|i| i.key_pressed(key)) && pidx < marks.len() {
-                let mark = &marks[pidx];
-                if let Some(asset) = self.current_asset.read().clone() {
-                    self.playback_position.store(mark.position, Ordering::Relaxed);
-                    let sp = (mark.position as f64 * asset.pcm.len() as f64) as u64;
-                    self.playback_sample_index.store(sp, Ordering::Relaxed);
-                    self.start_playback(asset);
+            let key_pad: Vec<(egui::Key, usize)> = vec![
+                (egui::Key::Num1,0),(egui::Key::Num2,1),(egui::Key::Num3,2),(egui::Key::Num4,3),
+                (egui::Key::Q,4),(egui::Key::W,5),(egui::Key::E,6),(egui::Key::R,7),
+                (egui::Key::A,8),(egui::Key::S,9),(egui::Key::D,10),(egui::Key::F,11),
+                (egui::Key::Z,12),(egui::Key::X,13),(egui::Key::C,14),(egui::Key::V,15),
+            ];
+            let marks = self.samples_manager.get_marks();
+            for (key, pidx) in key_pad {
+                if ctx.input(|i| i.key_pressed(key)) && pidx < marks.len() {
+                    let mark = &marks[pidx];
+                    if let Some(asset) = self.current_asset.read().clone() {
+                        self.playback_position.store(mark.position, Ordering::Relaxed);
+                        let sp = (mark.position as f64 * asset.pcm.len() as f64) as u64;
+                        self.playback_sample_index.store(sp, Ordering::Relaxed);
+                        self.start_playback(asset);
+                    }
                 }
             }
-        }
-
-        if self.loading.load(Ordering::Relaxed) || self.drum_loading.load(Ordering::Relaxed) {
-            let sr = ctx.screen_rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("loading")));
-            painter.rect_filled(sr, 0.0, egui::Color32::from_black_alpha(180));
-            let c = sr.center();
-            painter.rect_filled(egui::Rect::from_center_size(c, egui::vec2(240.0, 100.0)), 12.0, egui::Color32::from_gray(28));
-            let time = ctx.input(|i| i.time) as f32;
-            for i in 0u32..8 {
-                let angle = time * 3.0 + i as f32 * std::f32::consts::TAU / 8.0;
-                let off = egui::vec2(angle.cos(), angle.sin()) * 20.0;
-                let alpha = (100.0 + (i as f32 / 8.0) * 155.0) as u8;
-                painter.circle_filled(egui::pos2(c.x+off.x, c.y+off.y-10.0), 6.0, egui::Color32::from_rgba_unmultiplied(80,160,255,alpha));
+            if self.loading.load(Ordering::Relaxed) || self.drum_loading.load(Ordering::Relaxed) {
+                let sr = ctx.screen_rect();
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("loading")));
+                painter.rect_filled(sr, 0.0, egui::Color32::from_black_alpha(180));
+                let c = sr.center();
+                painter.rect_filled(egui::Rect::from_center_size(c, egui::vec2(240.0, 100.0)), 12.0, egui::Color32::from_gray(28));
+                let time = ctx.input(|i| i.time) as f32;
+                for i in 0u32..8 {
+                    let angle = time * 3.0 + i as f32 * std::f32::consts::TAU / 8.0;
+                    let off = egui::vec2(angle.cos(), angle.sin()) * 20.0;
+                    let alpha = (100.0 + (i as f32 / 8.0) * 155.0) as u8;
+                    painter.circle_filled(egui::pos2(c.x+off.x, c.y+off.y-10.0), 6.0, egui::Color32::from_rgba_unmultiplied(80,160,255,alpha));
+                }
+                painter.text(egui::pos2(c.x, c.y+25.0), egui::Align2::CENTER_TOP, "Loading...", egui::FontId::proportional(16.0), egui::Color32::WHITE);
             }
-            painter.text(egui::pos2(c.x, c.y+25.0), egui::Align2::CENTER_TOP, "Loading...", egui::FontId::proportional(16.0), egui::Color32::WHITE);
-        }
-
-        ctx.request_repaint_after(Duration::from_millis(16));
+            ctx.request_repaint_after(Duration::from_millis(16));
+            
+            // --- ADD SCROLL AREA END ---
+            });
+            // --- ADD SCROLL AREA END ---
+        });
     }
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Step Sequencer — chop rows + drum track rows
+//  Step Sequencer
 // ─────────────────────────────────────────────────────────────
 impl AppState {
     fn seq_header_ui(&mut self, ui: &mut egui::Ui) {
@@ -481,27 +539,10 @@ impl AppState {
                 if ui.add(egui::Button::new(egui::RichText::new("🎹 Piano Roll").small().color(egui::Color32::from_rgb(140,180,255)))).clicked() {
                     *self.piano_roll_open.write() = true;
                 }
-                // Add drum track button
                 if ui.add(egui::Button::new(egui::RichText::new("＋ Add Track").small().color(egui::Color32::from_rgb(80,220,140)))).clicked() {
                     self.load_drum_track();
                 }
             });
-        });
-    }
-
-    fn draw_beat_header(ui: &mut egui::Ui, label_w: f32, step_w: f32) {
-        ui.horizontal(|ui| {
-            ui.add_space(label_w + 8.0);
-            for step in 0..NUM_STEPS {
-                let sz = egui::vec2(step_w - 2.0, 13.0);
-                let (r, _) = ui.allocate_exact_size(sz, egui::Sense::hover());
-                if step % 4 == 0 {
-                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
-                        format!("{}", step / 4 + 1), egui::FontId::proportional(9.0), egui::Color32::from_gray(75));
-                }
-                let tc = if step % 4 == 0 { egui::Color32::from_gray(65) } else { egui::Color32::from_gray(38) };
-                ui.painter().vline(r.left(), r.y_range(), egui::Stroke::new(0.5, tc));
-            }
         });
     }
 
@@ -539,6 +580,45 @@ impl AppState {
         }
     }
 
+    /// Draw 4 ADSR knobs into a horizontal strip.
+    /// `strip_rect` should be label_w wide and knob_row_h tall.
+    /// Returns (new_adsr, changed).
+    fn draw_adsr_knobs(
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        knob_area: egui::Rect,  // the full width knob row rect (after label)
+        adsr: ADSREnvelope,
+        color: egui::Color32,
+        base_id: egui::Id,
+    ) -> (ADSREnvelope, bool) {
+        let mut adsr = adsr;
+        let mut changed = false;
+        let knob_r = (knob_area.height() * 0.35).min(14.0);
+        let knob_w = knob_area.width() / 4.0;
+        let cy = knob_area.center().y;
+
+        let params: [(&str, f32, f32, &mut f32); 4] = [
+            ("A", 0.0, 2.0, &mut adsr.attack),
+            ("D", 0.0, 2.0, &mut adsr.decay),
+            ("S", 0.0, 1.0, &mut adsr.sustain),
+            ("R", 0.0, 3.0, &mut adsr.release),
+        ];
+
+        for (i, (label, min, max, val)) in params.into_iter().enumerate() {
+            let cx = knob_area.left() + knob_w * i as f32 + knob_w * 0.5;
+            let center = egui::pos2(cx, cy);
+            let norm = ((*val - min) / (max - min)).clamp(0.0, 1.0);
+            let mut norm_mut = norm;
+            let kid = base_id.with(i);
+            if draw_knob(painter, ui, center, knob_r, &mut norm_mut, color, label, kid) {
+                *val = min + norm_mut * (max - min);
+                changed = true;
+            }
+        }
+
+        (adsr, changed)
+    }
+
     fn load_drum_track(&self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Audio", &["mp3","wav","flac","ogg","m4a","aac"])
@@ -549,7 +629,6 @@ impl AppState {
             let drum_loading = self.drum_loading.clone();
             let status = self.status.clone();
             drum_loading.store(true, Ordering::Relaxed);
-
             std::thread::spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     audio_manager.load_audio(path.to_str().unwrap_or(""))
@@ -569,275 +648,346 @@ impl AppState {
         }
     }
 
+    fn ensure_chop_adsr(&self, needed: usize) {
+        let mut v = self.chop_adsr.write();
+        while v.len() < needed { v.push(ADSREnvelope::default()); }
+    }
+
     fn draw_step_sequencer(&mut self, ui: &mut egui::Ui, asset: &crate::audio::AudioAsset) {
-    let frame = egui::Frame::none()
-        .fill(egui::Color32::from_rgb(15, 15, 21))
-        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-        .rounding(egui::Rounding::same(6.0))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(38)));
-    frame.show(ui, |ui| {
-        self.seq_header_ui(ui);
-        ui.add_space(5.0);
-        
-        let label_w = 158.0;
-        let step_w = 42.0; // Fixed step width for scrolling
-        let row_h = 26.0;
-        let current_step = *self.seq_current_step.read();
-        let seq_playing = self.seq_playing.load(Ordering::Relaxed);
-        
-        // ── Scrollable area (steps only, labels stay fixed) ────────────────
-        egui::ScrollArea::horizontal()
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                // Beat header
+        // Layout per track:
+        //   Row 1: [label 130px] [step buttons × 16 @ 38px each]
+        //   Row 2: [label 130px] [4 ADSR knobs spanning same width as steps]
+
+        let label_w  = 130.0;
+        let step_w   = 38.0;
+        let steps_total = step_w * NUM_STEPS as f32;
+        let row_h    = 36.0;   // step button height
+        let knob_h   = 52.0;   // knob row height
+
+        let marks = self.samples_manager.get_marks_for_sample(&asset.file_name);
+        self.ensure_chop_adsr(marks.len());
+
+        let frame = egui::Frame::none()
+            .fill(egui::Color32::from_rgb(15, 15, 21))
+            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+            .rounding(egui::Rounding::same(6.0))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(38)));
+
+        frame.show(ui, |ui| {
+            self.seq_header_ui(ui);
+            ui.add_space(4.0);
+
+            let current_step = *self.seq_current_step.read();
+            let seq_playing  = self.seq_playing.load(Ordering::Relaxed);
+
+            // beat-number header
+            ui.horizontal(|ui| {
+                ui.add_space(label_w + 8.0);
+                for step in 0..NUM_STEPS {
+                    let sz = egui::vec2(step_w - 2.0, 13.0);
+                    let (r, _) = ui.allocate_exact_size(sz, egui::Sense::hover());
+                    if step % 4 == 0 {
+                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
+                            format!("{}", step / 4 + 1), egui::FontId::proportional(9.0), egui::Color32::from_gray(75));
+                    }
+                    let tc = if step % 4 == 0 { egui::Color32::from_gray(65) } else { egui::Color32::from_gray(38) };
+                    ui.painter().vline(r.left(), r.y_range(), egui::Stroke::new(0.5, tc));
+                }
+            });
+
+            // ── chop rows ────────────────────────────────────
+            let has_chops = !marks.is_empty();
+            if has_chops {
+                ui.label(egui::RichText::new("  Chops").small().color(egui::Color32::from_gray(70)));
+            }
+
+            for (pad_idx, mark) in marks.iter().enumerate() {
+                let dur      = asset.frames as f32 / asset.sample_rate as f32;
+                let time_at  = mark.position * dur;
+                let color    = pad_color(pad_idx);
+                let color_dim = pad_color_dim(pad_idx);
+                let is_focused = matches!(self.waveform_focus.read().clone(), WaveformFocus::MainSample);
+
+                // ── Step button row ───────────────────────────
                 ui.horizontal(|ui| {
-                    ui.add_space(label_w + 8.0);
-                    for step in 0..NUM_STEPS {
-                        let sz = egui::vec2(step_w - 2.0, 13.0);
-                        let (r, _) = ui.allocate_exact_size(sz, egui::Sense::hover());
-                        if step % 4 == 0 {
-                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
-                                format!("{}", step / 4 + 1), egui::FontId::proportional(9.0), egui::Color32::from_gray(75));
+                    let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
+                    let label_bg = if is_focused { egui::Color32::from_rgb(24,28,38) } else { egui::Color32::from_rgb(20,20,28) };
+                    ui.painter().rect_filled(lr, 3.0, label_bg);
+                    ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(1.0, egui::Color32::from_gray(38)));
+                    ui.painter().rect_filled(egui::Rect::from_min_size(lr.min + egui::vec2(5.0, 6.0), egui::vec2(4.0, row_h - 12.0)), 2.0, color);
+                    ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y-5.0), egui::Align2::LEFT_CENTER,
+                        format!("Chop #{}", mark.id), egui::FontId::proportional(11.0), color);
+                    ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y+6.0), egui::Align2::LEFT_CENTER,
+                        format!("{:.2}s", time_at), egui::FontId::proportional(8.5), egui::Color32::from_gray(95));
+                    if lresp.clicked() { *self.waveform_focus.write() = WaveformFocus::MainSample; }
+                    lresp.context_menu(|ui| {
+                        ui.set_min_width(155.0);
+                        ui.label(egui::RichText::new(format!("Chop #{} @ {:.2}s", mark.id, time_at)).small().color(egui::Color32::from_gray(140)));
+                        ui.separator();
+                        if ui.button("🎹  Open Piano Roll").clicked() { *self.piano_roll_open.write() = true; ui.close_menu(); }
+                        ui.separator();
+                        if seq_playing {
+                            if ui.button("⏹  Stop Pattern").clicked() { self.stop_sequencer(); ui.close_menu(); }
+                        } else {
+                            if ui.button("▶  Play Pattern").clicked() { self.start_sequencer(); ui.close_menu(); }
                         }
-                        let tc = if step % 4 == 0 { egui::Color32::from_gray(65) } else { egui::Color32::from_gray(38) };
-                        ui.painter().vline(r.left(), r.y_range(), egui::Stroke::new(0.5, tc));
+                        if ui.button("🗑  Clear Chop Steps").clicked() {
+                            let mut g = self.seq_grid.write();
+                            for s in g.iter_mut() { s.retain(|&p| p != pad_idx); }
+                            ui.close_menu();
+                        }
+                        if ui.button("↺  Reset ADSR").clicked() {
+                            if let Some(a) = self.chop_adsr.write().get_mut(pad_idx) { *a = ADSREnvelope::default(); }
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    let grid_snap = self.seq_grid.read().clone();
+                    let is_ons: [bool; NUM_STEPS] = std::array::from_fn(|s| grid_snap[s].contains(&pad_idx));
+                    Self::draw_step_buttons(ui, step_w, row_h, color, color_dim, &is_ons, current_step, seq_playing,
+                        &mut |step| {
+                            let mut grid = self.seq_grid.write();
+                            let sp = &mut grid[step];
+                            if let Some(i) = sp.iter().position(|&p| p == pad_idx) { sp.remove(i); } else { sp.push(pad_idx); }
+                        }
+                    );
+                });
+
+                // ── Knob row ──────────────────────────────────
+                ui.horizontal(|ui| {
+                    // Spacer matching label width
+                    let (label_space, _) = ui.allocate_exact_size(egui::vec2(label_w, knob_h), egui::Sense::hover());
+                    ui.painter().rect_filled(label_space, 0.0, egui::Color32::from_rgb(12, 12, 18));
+
+                    ui.add_space(8.0);
+
+                    // knob area — same width as 16 steps
+                    let (knob_rect, _) = ui.allocate_exact_size(egui::vec2(steps_total, knob_h), egui::Sense::hover());
+                    ui.painter().rect_filled(knob_rect, 2.0, egui::Color32::from_rgb(16, 16, 24));
+                    ui.painter().rect_stroke(knob_rect, 2.0, egui::Stroke::new(0.5, egui::Color32::from_gray(30)));
+
+                    // Draw the 4 knobs — only across first quarter of width to keep them on the left
+                    // Actually spread them evenly across 4 "columns" matching beats 1-4
+                    let knob_zone = egui::Rect::from_min_size(knob_rect.min, egui::vec2(steps_total, knob_h));
+                    let adsr_now = self.chop_adsr.read().get(pad_idx).copied().unwrap_or_default();
+                    let base_id = egui::Id::new("chop_knob").with(pad_idx);
+                    let painter = ui.painter().clone();
+                    let (new_adsr, adsr_changed) = Self::draw_adsr_knobs(ui, &painter, knob_zone, adsr_now, color, base_id);
+                    if adsr_changed {
+                        if let Some(a) = self.chop_adsr.write().get_mut(pad_idx) { *a = new_adsr; }
                     }
                 });
-                
-                // ── Chop rows ─────────────────────────────────────
-                let marks = self.samples_manager.get_marks_for_sample(&asset.file_name);
-                let has_chops = !marks.is_empty();
-                if has_chops {
-                    ui.label(egui::RichText::new("  Chops").small().color(egui::Color32::from_gray(70)));
-                }
-                for (pad_idx, mark) in marks.iter().enumerate() {
-                    let dur = asset.frames as f32 / asset.sample_rate as f32;
-                    let time_at = mark.position * dur;
-                    let color = pad_color(pad_idx);
-                    let color_dim = pad_color_dim(pad_idx);
-                    let is_focused = matches!(self.waveform_focus.read().clone(), WaveformFocus::MainSample);
-                    
-                    ui.horizontal(|ui| {
-                        // Label (fixed, outside scroll)
-                        let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
-                        let label_bg = if is_focused { egui::Color32::from_rgb(24, 28, 38) } else { egui::Color32::from_rgb(20,20,28) };
-                        ui.painter().rect_filled(lr, 3.0, label_bg);
-                        ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(1.0, egui::Color32::from_gray(38)));
-                        ui.painter().rect_filled(egui::Rect::from_min_size(lr.min + egui::vec2(5.0, 7.0), egui::vec2(4.0, row_h - 14.0)), 2.0, color);
-                        ui.painter().text(egui::pos2(lr.min.x + 15.0, lr.center().y - 4.0), egui::Align2::LEFT_CENTER,
-                            format!("Chop #{}", mark.id), egui::FontId::proportional(11.0), color);
-                        ui.painter().text(egui::pos2(lr.min.x + 15.0, lr.center().y + 6.0), egui::Align2::LEFT_CENTER,
-                            format!("{:.2}s", time_at), egui::FontId::proportional(8.5), egui::Color32::from_gray(95));
-                        
-                        if lresp.clicked() {
-                            *self.waveform_focus.write() = WaveformFocus::MainSample;
-                        }
-                        
-                        lresp.context_menu(|ui| {
-                            ui.set_min_width(155.0);
-                            ui.label(egui::RichText::new(format!("Chop #{} @ {:.2}s", mark.id, time_at)).small().color(egui::Color32::from_gray(140)));
-                            ui.separator();
-                            if ui.button("🎹  Open Piano Roll").clicked() { *self.piano_roll_open.write() = true; ui.close_menu(); }
-                            ui.separator();
-                            if seq_playing {
-                                if ui.button("⏹  Stop Pattern").clicked() { self.stop_sequencer(); ui.close_menu(); }
-                            } else {
-                                if ui.button("▶  Play Pattern").clicked() { self.start_sequencer(); ui.close_menu(); }
-                            }
-                            if ui.button("🗑  Clear Chop Steps").clicked() {
-                                let mut g = self.seq_grid.write();
-                                for s in g.iter_mut() { s.retain(|&p| p != pad_idx); }
-                                ui.close_menu();
-                            }
-                        });
-                        
-                        ui.add_space(8.0);
-                        
-                        // Step buttons (scrollable)
-                        let grid_snap = self.seq_grid.read().clone();
-                        let is_ons: [bool; NUM_STEPS] = std::array::from_fn(|s| grid_snap[s].contains(&pad_idx));
-                        Self::draw_step_buttons(ui, step_w, row_h, color, color_dim, &is_ons, current_step, seq_playing,
-                            &mut |step| {
-                                let mut grid = self.seq_grid.write();
-                                let sp = &mut grid[step];
-                                if let Some(i) = sp.iter().position(|&p| p == pad_idx) { sp.remove(i); } else { sp.push(pad_idx); }
-                            }
-                        );
-                    });
-                }
-                
-                // ── Drum track rows ───────────────────────────────
-                let n_drums = self.drum_tracks.read().len();
-                if n_drums > 0 {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("  Drum Tracks").small().color(egui::Color32::from_gray(70)));
-                    for drum_idx in 0..n_drums {
-                        let color = drum_color(drum_idx);
-                        let color_dim = drum_color_dim(drum_idx);
-                        let (file_name, time_str, muted, steps) = {
-                            let tracks = self.drum_tracks.read();
-                            let t = &tracks[drum_idx];
-                            (
-                                t.asset.file_name.clone(),
-                                format!("{:.2}s", t.asset.frames as f32 / t.asset.sample_rate as f32),
-                                t.muted,
-                                t.steps,
-                            )
-                        };
-                        let is_focused = matches!(self.waveform_focus.read().clone(), WaveformFocus::DrumTrack(i) if i == drum_idx);
-                        
-                        ui.horizontal(|ui| {
-                            // Label (fixed)
-                            let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
-                            let label_bg = if is_focused { egui::Color32::from_rgb(20, 30, 25) } else { egui::Color32::from_rgb(20,20,28) };
-                            ui.painter().rect_filled(lr, 3.0, if muted { egui::Color32::from_rgb(18,18,22) } else { label_bg });
-                            ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(
-                                if is_focused { 1.5 } else { 1.0 },
-                                if is_focused { color } else { egui::Color32::from_gray(38) },
-                            ));
-                            let swatch_col = if muted { egui::Color32::from_gray(50) } else { color };
-                            ui.painter().rect_filled(egui::Rect::from_min_size(lr.min + egui::vec2(5.0, 7.0), egui::vec2(4.0, row_h - 14.0)), 2.0, swatch_col);
-                            
-                            let display_name = if file_name.len() > 16 { format!("{}…", &file_name[..14]) } else { file_name.clone() };
-                            let text_col = if muted { egui::Color32::from_gray(80) } else { color };
-                            ui.painter().text(egui::pos2(lr.min.x + 15.0, lr.center().y - 4.0), egui::Align2::LEFT_CENTER,
-                                display_name, egui::FontId::proportional(11.0), text_col);
-                            ui.painter().text(egui::pos2(lr.min.x + 15.0, lr.center().y + 6.0), egui::Align2::LEFT_CENTER,
-                                &time_str, egui::FontId::proportional(8.5), egui::Color32::from_gray(90));
-                            
-                            if lresp.clicked() {
-                                *self.waveform_focus.write() = WaveformFocus::DrumTrack(drum_idx);
-                                *self.status.write() = format!("Showing waveform: {}", file_name);
-                            }
-                            
-                            let drum_tracks_ref = self.drum_tracks.clone();
-                            lresp.context_menu(|ui| {
-                                ui.set_min_width(160.0);
-                                ui.label(egui::RichText::new(&file_name).small().color(egui::Color32::from_gray(140)));
-                                ui.separator();
-                                if ui.button(if muted { "🔊  Unmute" } else { "🔇  Mute" }).clicked() {
-                                    if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.muted = !t.muted; }
-                                    ui.close_menu();
-                                }
-                                if ui.button("🗑  Clear Steps").clicked() {
-                                    if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.steps = [false; NUM_STEPS]; }
-                                    ui.close_menu();
-                                }
-                                ui.separator();
-                                if ui.button(egui::RichText::new("✕  Remove Track").color(egui::Color32::from_rgb(220,80,60))).clicked() {
-                                    drum_tracks_ref.write().remove(drum_idx);
-                                    ui.close_menu();
-                                }
-                            });
-                            
-                            ui.add_space(8.0);
-                            
-                            // Step buttons (scrollable)
-                            Self::draw_step_buttons(ui, step_w, row_h, color, color_dim, &steps, current_step, seq_playing,
-                                &mut |step| {
-                                    if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) {
-                                        t.steps[step] = !t.steps[step];
-                                    }
-                                }
-                            );
-                        });
+
+                ui.add_space(2.0);
+            }
+
+            // ── drum rows ─────────────────────────────────────
+            let n_drums = self.drum_tracks.read().len();
+            if n_drums > 0 {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("  Drum Tracks").small().color(egui::Color32::from_gray(70)));
+            }
+
+            for drum_idx in 0..n_drums {
+                let color     = drum_color(drum_idx);
+                let color_dim = drum_color_dim(drum_idx);
+                let (file_name, time_str, muted, steps) = {
+                    let tracks = self.drum_tracks.read();
+                    let t = &tracks[drum_idx];
+                    (t.asset.file_name.clone(),
+                     format!("{:.2}s", t.asset.frames as f32 / t.asset.sample_rate as f32),
+                     t.muted, t.steps)
+                };
+                let is_focused = matches!(self.waveform_focus.read().clone(), WaveformFocus::DrumTrack(i) if i == drum_idx);
+
+                // ── Step button row ───────────────────────────
+                ui.horizontal(|ui| {
+                    let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
+                    let label_bg = if is_focused { egui::Color32::from_rgb(20,30,25) } else { egui::Color32::from_rgb(20,20,28) };
+                    ui.painter().rect_filled(lr, 3.0, if muted { egui::Color32::from_rgb(18,18,22) } else { label_bg });
+                    ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(
+                        if is_focused { 1.5 } else { 1.0 },
+                        if is_focused { color } else { egui::Color32::from_gray(38) },
+                    ));
+                    ui.painter().rect_filled(egui::Rect::from_min_size(lr.min+egui::vec2(5.0, 6.0), egui::vec2(4.0, row_h-12.0)), 2.0,
+                        if muted { egui::Color32::from_gray(50) } else { color });
+                    let dn = if file_name.len() > 14 { format!("{}…", &file_name[..12]) } else { file_name.clone() };
+                    ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y-5.0), egui::Align2::LEFT_CENTER,
+                        dn, egui::FontId::proportional(11.0), if muted { egui::Color32::from_gray(80) } else { color });
+                    ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y+6.0), egui::Align2::LEFT_CENTER,
+                        &time_str, egui::FontId::proportional(8.5), egui::Color32::from_gray(90));
+                    if lresp.clicked() {
+                        *self.waveform_focus.write() = WaveformFocus::DrumTrack(drum_idx);
+                        *self.status.write() = format!("Showing waveform: {}", file_name);
                     }
-                }
-                
-                if !has_chops && n_drums == 0 {
-                    ui.label(egui::RichText::new("No chops yet — press M while playing to create chop points, or click ＋ Add Track to load a drum sample")
-                        .small().color(egui::Color32::from_gray(80)).italics());
-                }
-                ui.add_space(3.0);
-                ui.label(egui::RichText::new("Click steps to toggle  ·  Click row label to preview waveform  ·  Right-click label for options")
-                    .small().color(egui::Color32::from_gray(58)));
-            });
-    });
-}
+                    let drum_tracks_ref = self.drum_tracks.clone();
+                    lresp.context_menu(|ui| {
+                        ui.set_min_width(160.0);
+                        ui.label(egui::RichText::new(&file_name).small().color(egui::Color32::from_gray(140)));
+                        ui.separator();
+                        if ui.button(if muted { "🔊  Unmute" } else { "🔇  Mute" }).clicked() {
+                            if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.muted = !t.muted; }
+                            ui.close_menu();
+                        }
+                        if ui.button("🗑  Clear Steps").clicked() {
+                            if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.steps = [false; NUM_STEPS]; }
+                            ui.close_menu();
+                        }
+                        if ui.button("↺  Reset ADSR").clicked() {
+                            if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.adsr = ADSREnvelope::default(); }
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button(egui::RichText::new("✕  Remove Track").color(egui::Color32::from_rgb(220,80,60))).clicked() {
+                            drum_tracks_ref.write().remove(drum_idx);
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    Self::draw_step_buttons(ui, step_w, row_h, color, color_dim, &steps, current_step, seq_playing,
+                        &mut |step| {
+                            if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) { t.steps[step] = !t.steps[step]; }
+                        }
+                    );
+                });
+
+                // ── Knob row ──────────────────────────────────
+                ui.horizontal(|ui| {
+                    let (label_space, _) = ui.allocate_exact_size(egui::vec2(label_w, knob_h), egui::Sense::hover());
+                    ui.painter().rect_filled(label_space, 0.0, egui::Color32::from_rgb(12, 12, 18));
+
+                    ui.add_space(8.0);
+
+                    let (knob_rect, _) = ui.allocate_exact_size(egui::vec2(steps_total, knob_h), egui::Sense::hover());
+                    ui.painter().rect_filled(knob_rect, 2.0, egui::Color32::from_rgb(16, 16, 24));
+                    ui.painter().rect_stroke(knob_rect, 2.0, egui::Stroke::new(0.5, egui::Color32::from_gray(30)));
+
+                    let adsr_now = self.drum_tracks.read().get(drum_idx).map(|t| t.adsr).unwrap_or_default();
+                    let base_id = egui::Id::new("drum_knob").with(drum_idx);
+                    let painter = ui.painter().clone();
+                    let (new_adsr, adsr_changed) = Self::draw_adsr_knobs(ui, &painter, knob_rect, adsr_now, color, base_id);
+                    if adsr_changed {
+                        if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) { t.adsr = new_adsr; }
+                    }
+                });
+
+                ui.add_space(2.0);
+            }
+
+            if !has_chops && n_drums == 0 {
+                ui.label(egui::RichText::new(
+                    "No chops yet — press M while playing to create chop points, or click ＋ Add Track to load a drum sample")
+                    .small().color(egui::Color32::from_gray(80)).italics());
+            }
+            ui.add_space(3.0);
+            ui.label(egui::RichText::new(
+                "Click steps to toggle  ·  Click label to preview waveform  ·  Right-click for options  ·  Drag knobs to shape ADSR")
+                .small().color(egui::Color32::from_gray(58)));
+        });
+    }
 
     fn draw_step_sequencer_drums_only(&mut self, ui: &mut egui::Ui) {
-    let frame = egui::Frame::none()
-        .fill(egui::Color32::from_rgb(15,15,21))
-        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-        .rounding(egui::Rounding::same(6.0))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(38)));
-    frame.show(ui, |ui| {
-        self.seq_header_ui(ui);
-        
-        let label_w = 158.0;
-        let step_w = 42.0; // Fixed step width for scrolling
-        let row_h = 26.0;
-        let current_step = *self.seq_current_step.read();
-        let seq_playing = self.seq_playing.load(Ordering::Relaxed);
-        
-        ui.add_space(5.0);
-        
-        // ── Scrollable area ─────────────────────────────────────
-        egui::ScrollArea::horizontal()
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                // Beat header
-                ui.horizontal(|ui| {
-                    ui.add_space(label_w + 8.0);
-                    for step in 0..NUM_STEPS {
-                        let sz = egui::vec2(step_w - 2.0, 13.0);
-                        let (r, _) = ui.allocate_exact_size(sz, egui::Sense::hover());
-                        if step % 4 == 0 {
-                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
-                                format!("{}", step / 4 + 1), egui::FontId::proportional(9.0), egui::Color32::from_gray(75));
-                        }
-                        let tc = if step % 4 == 0 { egui::Color32::from_gray(65) } else { egui::Color32::from_gray(38) };
-                        ui.painter().vline(r.left(), r.y_range(), egui::Stroke::new(0.5, tc));
+        let label_w    = 130.0;
+        let step_w     = 38.0;
+        let steps_total = step_w * NUM_STEPS as f32;
+        let row_h      = 36.0;
+        let knob_h     = 52.0;
+
+        let frame = egui::Frame::none()
+            .fill(egui::Color32::from_rgb(15,15,21))
+            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+            .rounding(egui::Rounding::same(6.0))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(38)));
+
+        frame.show(ui, |ui| {
+            self.seq_header_ui(ui);
+            ui.add_space(4.0);
+
+            let current_step = *self.seq_current_step.read();
+            let seq_playing  = self.seq_playing.load(Ordering::Relaxed);
+
+            ui.horizontal(|ui| {
+                ui.add_space(label_w + 8.0);
+                for step in 0..NUM_STEPS {
+                    let sz = egui::vec2(step_w - 2.0, 13.0);
+                    let (r, _) = ui.allocate_exact_size(sz, egui::Sense::hover());
+                    if step % 4 == 0 {
+                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
+                            format!("{}", step / 4 + 1), egui::FontId::proportional(9.0), egui::Color32::from_gray(75));
                     }
-                });
-                
-                let n_drums = self.drum_tracks.read().len();
-                for drum_idx in 0..n_drums {
-                    let color = drum_color(drum_idx);
-                    let color_dim = drum_color_dim(drum_idx);
-                    let (file_name, steps, muted) = {
-                        let tracks = self.drum_tracks.read();
-                        let t = &tracks[drum_idx];
-                        (t.asset.file_name.clone(), t.steps, t.muted)
-                    };
-                    let is_focused = matches!(self.waveform_focus.read().clone(), WaveformFocus::DrumTrack(i) if i == drum_idx);
-                    
-                    ui.horizontal(|ui| {
-                        let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
-                        ui.painter().rect_filled(lr, 3.0, if is_focused { egui::Color32::from_rgb(20,30,25) } else { egui::Color32::from_rgb(20,20,28) });
-                        ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(if is_focused{1.5}else{1.0}, if is_focused{color}else{egui::Color32::from_gray(38)}));
-                        ui.painter().rect_filled(egui::Rect::from_min_size(lr.min + egui::vec2(5.0,7.0), egui::vec2(4.0, row_h-14.0)), 2.0, if muted{egui::Color32::from_gray(50)}else{color});
-                        
-                        let dn = if file_name.len() > 16 { format!("{}…", &file_name[..14]) } else { file_name.clone() };
-                        ui.painter().text(egui::pos2(lr.min.x+15.0, lr.center().y-4.0), egui::Align2::LEFT_CENTER, dn, egui::FontId::proportional(11.0), if muted{egui::Color32::from_gray(80)}else{color});
-                        
-                        if lresp.clicked() { *self.waveform_focus.write() = WaveformFocus::DrumTrack(drum_idx); }
-                        
-                        let drum_tracks_ref = self.drum_tracks.clone();
-                        lresp.context_menu(|ui| {
-                            ui.set_min_width(155.0);
-                            if ui.button(if muted{"🔊 Unmute"}else{"🔇 Mute"}).clicked() {
-                                if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.muted = !t.muted; }
-                                ui.close_menu();
-                            }
-                            if ui.button("🗑 Clear Steps").clicked() {
-                                if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.steps = [false; NUM_STEPS]; }
-                                ui.close_menu();
-                            }
-                            if ui.button(egui::RichText::new("✕ Remove").color(egui::Color32::from_rgb(220,80,60))).clicked() {
-                                drum_tracks_ref.write().remove(drum_idx); ui.close_menu();
-                            }
-                        });
-                        
-                        ui.add_space(8.0);
-                        
-                        Self::draw_step_buttons(ui, step_w, row_h, color, color_dim, &steps, current_step, seq_playing,
-                            &mut |step| { if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) { t.steps[step] = !t.steps[step]; } });
-                    });
+                    let tc = if step % 4 == 0 { egui::Color32::from_gray(65) } else { egui::Color32::from_gray(38) };
+                    ui.painter().vline(r.left(), r.y_range(), egui::Stroke::new(0.5, tc));
                 }
             });
-    });
-}
+
+            let n_drums = self.drum_tracks.read().len();
+            for drum_idx in 0..n_drums {
+                let color     = drum_color(drum_idx);
+                let color_dim = drum_color_dim(drum_idx);
+                let (file_name, steps, muted) = {
+                    let tracks = self.drum_tracks.read();
+                    let t = &tracks[drum_idx];
+                    (t.asset.file_name.clone(), t.steps, t.muted)
+                };
+                let is_focused = matches!(self.waveform_focus.read().clone(), WaveformFocus::DrumTrack(i) if i == drum_idx);
+
+                ui.horizontal(|ui| {
+                    let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
+                    ui.painter().rect_filled(lr, 3.0, if is_focused{egui::Color32::from_rgb(20,30,25)}else{egui::Color32::from_rgb(20,20,28)});
+                    ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(if is_focused{1.5}else{1.0}, if is_focused{color}else{egui::Color32::from_gray(38)}));
+                    ui.painter().rect_filled(egui::Rect::from_min_size(lr.min+egui::vec2(5.0, 6.0), egui::vec2(4.0, row_h-12.0)), 2.0,
+                        if muted{egui::Color32::from_gray(50)}else{color});
+                    let dn = if file_name.len() > 14 { format!("{}…", &file_name[..12]) } else { file_name.clone() };
+                    ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y), egui::Align2::LEFT_CENTER,
+                        dn, egui::FontId::proportional(11.0), if muted{egui::Color32::from_gray(80)}else{color});
+                    if lresp.clicked() { *self.waveform_focus.write() = WaveformFocus::DrumTrack(drum_idx); }
+                    let drum_tracks_ref = self.drum_tracks.clone();
+                    lresp.context_menu(|ui| {
+                        ui.set_min_width(155.0);
+                        if ui.button(if muted{"🔊 Unmute"}else{"🔇 Mute"}).clicked() {
+                            if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.muted = !t.muted; }
+                            ui.close_menu();
+                        }
+                        if ui.button("↺  Reset ADSR").clicked() {
+                            if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.adsr = ADSREnvelope::default(); }
+                            ui.close_menu();
+                        }
+                        if ui.button("🗑 Clear Steps").clicked() {
+                            if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.steps = [false; NUM_STEPS]; }
+                            ui.close_menu();
+                        }
+                        if ui.button(egui::RichText::new("✕ Remove").color(egui::Color32::from_rgb(220,80,60))).clicked() {
+                            drum_tracks_ref.write().remove(drum_idx); ui.close_menu();
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    Self::draw_step_buttons(ui, step_w, row_h, color, color_dim, &steps, current_step, seq_playing,
+                        &mut |step| { if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) { t.steps[step] = !t.steps[step]; } });
+                });
+
+                ui.horizontal(|ui| {
+                    let (label_space, _) = ui.allocate_exact_size(egui::vec2(label_w, knob_h), egui::Sense::hover());
+                    ui.painter().rect_filled(label_space, 0.0, egui::Color32::from_rgb(12, 12, 18));
+                    ui.add_space(8.0);
+                    let (knob_rect, _) = ui.allocate_exact_size(egui::vec2(steps_total, knob_h), egui::Sense::hover());
+                    ui.painter().rect_filled(knob_rect, 2.0, egui::Color32::from_rgb(16, 16, 24));
+                    ui.painter().rect_stroke(knob_rect, 2.0, egui::Stroke::new(0.5, egui::Color32::from_gray(30)));
+                    let adsr_now = self.drum_tracks.read().get(drum_idx).map(|t| t.adsr).unwrap_or_default();
+                    let base_id = egui::Id::new("drum_only_knob").with(drum_idx);
+                    let painter = ui.painter().clone();
+                    let (new_adsr, adsr_changed) = Self::draw_adsr_knobs(ui, &painter, knob_rect, adsr_now, color, base_id);
+                    if adsr_changed {
+                        if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) { t.adsr = new_adsr; }
+                    }
+                });
+
+                ui.add_space(2.0);
+            }
+        });
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -905,7 +1055,6 @@ impl AppState {
                     painter.rect_filled(outer_rect, 0.0, egui::Color32::from_rgb(13, 13, 19));
                     let grid_origin = egui::pos2(outer_rect.min.x + pad_label_w, outer_rect.min.y + header_h);
 
-                    // Step header
                     for step in 0..NUM_STEPS {
                         let x = grid_origin.x + step as f32 * cell_w;
                         let hr = egui::Rect::from_min_size(egui::pos2(x, outer_rect.min.y), egui::vec2(cell_w-1.0, header_h-1.0));
@@ -918,7 +1067,6 @@ impl AppState {
                         }
                     }
 
-                    // Pad rows
                     for (pad_idx, mark) in marks.iter().enumerate() {
                         let time_at = mark.position * dur;
                         let color = pad_color(pad_idx);
@@ -952,7 +1100,6 @@ impl AppState {
                         }
                     }
 
-                    // Click handling
                     let grid_rect = egui::Rect::from_min_size(grid_origin, egui::vec2(grid_w, n_rows as f32 * cell_h));
                     let gresp = ui.interact(grid_rect, egui::Id::new("pr_grid"), egui::Sense::click_and_drag());
                     if gresp.clicked() || gresp.dragged() {
