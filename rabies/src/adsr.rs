@@ -22,10 +22,10 @@ pub struct ADSREnvelope {
 impl Default for ADSREnvelope {
     fn default() -> Self {
         Self {
-            attack: 0.01,
-            decay: 0.1,
-            sustain: 0.8,
-            release: 0.2,
+            attack: 0.0,
+            decay: 0.0,
+            sustain: 0.0,
+            release: 0.0,
         }
     }
 }

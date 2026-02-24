@@ -26,7 +26,7 @@ The best spot for precision chopping is while the track is playing:
 Trigger your chops manually using the keyboard or click the on-screen pads.
 
 ```text
-┌─────┬─────┬─────┬─────┐
+┌─────┬─────┬─────┬───── ┐
 │  1  │  2  │  3  │  4  │  ← Pads 1-4
 ├─────┼─────┼─────┼─────┤
 │  Q  │  W  │  E  │  R  │  ← Pads 5-8

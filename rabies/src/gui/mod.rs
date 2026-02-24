@@ -7,7 +7,7 @@ use cpal::{SizedSample, FromSample};
 use atomic_float::AtomicF32;
 use crate::audio::{AudioAsset, AudioManager, WaveformAnalysis};
 use crate::samples::{SamplesManager, PlaybackMode};
-use crate::adsr::{ADSREnvelope, Voice};  // ADD THIS
+use crate::adsr::{ADSREnvelope, Voice};
 
 pub const NUM_STEPS: usize = 16;
 
@@ -15,19 +15,28 @@ pub const NUM_STEPS: usize = 16;
 pub struct DrumTrack {
     pub asset: Arc<AudioAsset>,
     pub waveform: Option<WaveformAnalysis>,
-    pub steps: [bool; NUM_STEPS],
+    pub steps: [bool; NUM_STEPS],           // whole-sample step row (used when no chops)
+    pub chop_steps: Vec<[bool; NUM_STEPS]>, // per-chop step rows (used when chopped)
     pub muted: bool,
-    pub adsr: ADSREnvelope,  // ADD THIS
+    pub adsr: ADSREnvelope,
 }
 
 impl DrumTrack {
     pub fn new(asset: Arc<AudioAsset>, waveform: Option<WaveformAnalysis>) -> Self {
-        Self { 
-            asset, 
-            waveform, 
-            steps: [false; NUM_STEPS], 
+        Self {
+            asset,
+            waveform,
+            steps: [false; NUM_STEPS],
+            chop_steps: Vec::new(),
             muted: false,
-            adsr: ADSREnvelope::default(),  // ADD THIS
+            adsr: ADSREnvelope::default(),
+        }
+    }
+
+    /// Grow chop_steps so it has at least `needed` rows.
+    pub fn ensure_chop_steps(&mut self, needed: usize) {
+        while self.chop_steps.len() < needed {
+            self.chop_steps.push([false; NUM_STEPS]);
         }
     }
 }
@@ -57,7 +66,7 @@ pub struct AppState {
     // Chop sequencer grid (pads on main sample)
     pub seq_grid: Arc<RwLock<Vec<Vec<usize>>>>,
     // ADSR for each chop (indexed by pad_idx)
-    pub chop_adsr: Arc<RwLock<Vec<ADSREnvelope>>>,  // ADD THIS
+    pub chop_adsr: Arc<RwLock<Vec<ADSREnvelope>>>,
     // Multi-sample drum tracks
     pub drum_tracks: Arc<RwLock<Vec<DrumTrack>>>,
     pub drum_loading: Arc<AtomicBool>,
@@ -67,7 +76,7 @@ pub struct AppState {
     pub seq_current_step: Arc<RwLock<usize>>,
     pub seq_last_step_time: Arc<RwLock<Option<Instant>>>,
     pub(crate) seq_stream_handle: Arc<RwLock<Option<cpal::Stream>>>,
-    pub(crate) seq_voice_queue: Arc<std::sync::Mutex<Vec<Voice>>>,  // CHANGED to Voice
+    pub(crate) seq_voice_queue: Arc<std::sync::Mutex<Vec<Voice>>>,
     // Which asset the waveform display shows
     pub waveform_focus: Arc<RwLock<WaveformFocus>>,
     pub piano_roll_open: Arc<RwLock<bool>>,
@@ -92,7 +101,7 @@ impl Default for AppState {
             selected_from_marker: Arc::new(RwLock::new(None)),
             selected_to_marker: Arc::new(RwLock::new(None)),
             seq_grid: Arc::new(RwLock::new(vec![Vec::new(); NUM_STEPS])),
-            chop_adsr: Arc::new(RwLock::new(Vec::new())),  // ADD THIS
+            chop_adsr: Arc::new(RwLock::new(Vec::new())),
             drum_tracks: Arc::new(RwLock::new(Vec::new())),
             drum_loading: Arc::new(AtomicBool::new(false)),
             seq_bpm: Arc::new(AtomicF32::new(120.0)),
@@ -106,6 +115,7 @@ impl Default for AppState {
         }
     }
 }
+
 impl AppState {
     pub fn start_playback(&self, asset: Arc<AudioAsset>) {
         self.stop_playback();
@@ -209,8 +219,8 @@ impl AppState {
         *self.seq_last_step_time.write() = Some(now);
         let step = { let mut s = self.seq_current_step.write(); let cur = *s; *s = (cur + 1) % NUM_STEPS; cur };
         let mut voices: Vec<Voice> = Vec::new();
-        
-        // Chop pad events
+
+        // Chop pad events (main sample)
         if let Some(asset) = self.current_asset.read().clone() {
             let active_pads = self.seq_grid.read()[step].clone();
             if !active_pads.is_empty() {
@@ -229,12 +239,30 @@ impl AppState {
                 }
             }
         }
-        
+
         // Drum track events
         {
             let tracks = self.drum_tracks.read();
             for track in tracks.iter() {
-                if !track.muted && track.steps[step] {
+                if track.muted { continue; }
+
+                // Check if this drum track has been chopped
+                let chop_marks = self.samples_manager.get_marks_for_sample(&track.asset.file_name);
+
+                if !chop_marks.is_empty() {
+                    // Fire individual chops based on per-chop step rows
+                    let channels = track.asset.channels as usize;
+                    let total_frames = track.asset.pcm.len() / channels.max(1);
+                    let pcm = Arc::new(track.asset.pcm.clone());
+                    for (chop_idx, mark) in chop_marks.iter().enumerate() {
+                        let fires = track.chop_steps.get(chop_idx).map(|s| s[step]).unwrap_or(false);
+                        if fires {
+                            let start_frame = (mark.position as f64 * total_frames as f64) as usize;
+                            voices.push(Voice::new(pcm.clone(), channels, start_frame, 1.0, track.adsr));
+                        }
+                    }
+                } else if track.steps[step] {
+                    // No chops — fire the whole sample
                     let channels = track.asset.channels as usize;
                     voices.push(Voice::new(
                         Arc::new(track.asset.pcm.clone()),
@@ -246,6 +274,7 @@ impl AppState {
                 }
             }
         }
+
         if voices.is_empty() { return; }
         self.ensure_seq_stream();
         self.seq_voice_queue.lock().unwrap().extend(voices);
@@ -274,7 +303,7 @@ impl AppState {
                         }
                     }
                     for s in data.iter_mut() { *s = 0.0; }
-                    if !seq_playing.load(Ordering::Relaxed) { 
+                    if !seq_playing.load(Ordering::Relaxed) {
                         for v in voices.iter_mut() { v.release(); }
                     }
                     let out_frames = data.len() / out_channels.max(1);
@@ -331,8 +360,6 @@ impl AppState {
         }
     }
 }
-
-struct VoiceState { frame_pos: f64, speed: f32, src_channels: usize, pcm: Arc<Vec<f32>> }
 
 struct StreamArgs {
     channels: u16, pcm: Vec<f32>,
