@@ -1,3 +1,5 @@
+// src/main.rs
+
 mod audio;
 mod gui;
 mod adsr;
@@ -6,11 +8,12 @@ mod samples;
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
+    // ✅ AppState is in gui module
     let app = gui::AppState::default();
-
+    
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([700.0, 720.0])  // Taller for MPC-style pad grid
+            .with_inner_size([700.0, 720.0])
             .with_min_inner_size([400.0, 500.0])
             .with_title("Audio Sampler"),
         ..Default::default()

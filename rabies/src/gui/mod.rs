@@ -8,7 +8,6 @@ use atomic_float::AtomicF32;
 use crate::audio::{AudioAsset, AudioManager, WaveformAnalysis};
 use crate::samples::{SamplesManager, PlaybackMode};
 use crate::adsr::{ADSREnvelope, Voice};
-
 pub const NUM_STEPS: usize = 16;
 
 /// One independently-loaded sample as a sequencer row.
@@ -17,8 +16,9 @@ pub struct DrumTrack {
     pub waveform: Option<WaveformAnalysis>,
     pub steps: [bool; NUM_STEPS],           // whole-sample step row (used when no chops)
     pub chop_steps: Vec<[bool; NUM_STEPS]>, // per-chop step rows (used when chopped)
+    pub chop_adsr: Vec<ADSREnvelope>,       // ✅ NEW: Individual ADSR per chop
     pub muted: bool,
-    pub adsr: ADSREnvelope,
+    pub adsr: ADSREnvelope,                 // Default/fallback ADSR
 }
 
 impl DrumTrack {
@@ -28,15 +28,20 @@ impl DrumTrack {
             waveform,
             steps: [false; NUM_STEPS],
             chop_steps: Vec::new(),
+            chop_adsr: Vec::new(),  // ✅ NEW
             muted: false,
             adsr: ADSREnvelope::default(),
         }
     }
-
-    /// Grow chop_steps so it has at least `needed` rows.
+    
+    /// Grow chop_steps and chop_adsr so they have at least `needed` rows.
     pub fn ensure_chop_steps(&mut self, needed: usize) {
         while self.chop_steps.len() < needed {
             self.chop_steps.push([false; NUM_STEPS]);
+        }
+        // ✅ NEW: Ensure chop_adsr matches chop count
+        while self.chop_adsr.len() < needed {
+            self.chop_adsr.push(self.adsr); // Copy default ADSR for new chops
         }
     }
 }
@@ -133,7 +138,7 @@ impl AppState {
         let stop_target = if stop_target >= 0.0 && start_pos >= stop_target { -1.0 } else { stop_target };
         self.playback_stop_target.store(stop_target, Ordering::Relaxed);
         self.is_playing.store(true, Ordering::Relaxed);
-
+        
         let host = cpal::default_host();
         let device = match host.default_output_device() {
             Some(d) => d,
@@ -143,18 +148,21 @@ impl AppState {
             Ok(c) => c,
             Err(e) => { *self.status.write() = format!("Audio config error: {}", e); self.is_playing.store(false, Ordering::Relaxed); return; }
         };
+        
         let args = StreamArgs {
             channels: asset.channels, pcm: asset.pcm.clone(),
             position: self.playback_position.clone(), sample_index: self.playback_sample_index.clone(),
             is_playing: self.is_playing.clone(), total_samples: asset.pcm.len() as u64,
             status: self.status.clone(), stop_target: self.playback_stop_target.clone(),
         };
+        
         let stream = match config.sample_format() {
             cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config.into(), args),
             cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config.into(), args),
             cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config.into(), args),
             _ => { *self.status.write() = "Unsupported sample format".to_string(); self.is_playing.store(false, Ordering::Relaxed); return; }
         };
+        
         match stream {
             Ok(s) => {
                 if let Err(e) = s.play() { *self.status.write() = format!("Playback error: {}", e); self.is_playing.store(false, Ordering::Relaxed); }
@@ -163,36 +171,57 @@ impl AppState {
             Err(e) => { *self.status.write() = format!("Stream error: {}", e); self.is_playing.store(false, Ordering::Relaxed); }
         }
     }
-
+    
     pub fn stop_playback(&self) {
         self.is_playing.store(false, Ordering::Relaxed);
         *self.stream_handle.write() = None;
         *self.playback_asset.write() = None;
     }
-
+    
     pub fn toggle_playback(&self) {
-        if let Some(asset) = self.current_asset.read().clone() {
+        // 1. Determine which asset to play based on current waveform focus
+        let asset_to_play = {
+            let focus = self.waveform_focus.read();
+            match &*focus {
+                WaveformFocus::MainSample => self.current_asset.read().clone(),
+                WaveformFocus::DrumTrack(idx) => {
+                    let tracks = self.drum_tracks.read();
+                    tracks.get(*idx).map(|t| t.asset.clone())
+                }
+            }
+        };
+        
+        // 2. Proceed only if we have an asset
+        if let Some(asset) = asset_to_play {
             if self.is_playing.load(Ordering::Relaxed) {
+                // Pause
                 self.is_playing.store(false, Ordering::Relaxed);
                 *self.status.write() = format!("Paused: {}", asset.file_name);
             } else {
+                // Play
+                // Handle seek logic based on mode (existing logic preserved)
                 if let PlaybackMode::CustomRegion { region_id } = self.samples_manager.get_playback_mode() {
                     if let Some(region) = self.samples_manager.get_region_by_id(region_id) {
                         if let Some(mark) = self.samples_manager.get_mark_by_id(region.from) {
-                            self.playback_position.store(mark.position, Ordering::Relaxed);
-                            let sp = (mark.position as f64 * asset.pcm.len() as f64) as u64;
-                            self.playback_sample_index.store(sp, Ordering::Relaxed);
+                            // Only seek if the mark belongs to the current asset
+                            if mark.sample_name == asset.file_name {
+                                self.playback_position.store(mark.position, Ordering::Relaxed);
+                                let sp = (mark.position as f64 * asset.pcm.len() as f64) as u64;
+                                self.playback_sample_index.store(sp, Ordering::Relaxed);
+                            }
                         }
                     }
                 } else if self.playback_position.load(Ordering::Relaxed) >= 0.999 {
                     self.playback_position.store(0.0, Ordering::Relaxed);
                     self.playback_sample_index.store(0, Ordering::Relaxed);
                 }
+                
+                // Start playback with the selected asset
                 self.start_playback(asset);
             }
         }
     }
-
+    
     pub fn seek_to(&self, normalized_pos: f32) {
         if let Some(asset) = self.current_asset.read().as_ref() {
             let was_playing = self.is_playing.load(Ordering::Relaxed);
@@ -205,21 +234,23 @@ impl AppState {
             if was_playing { self.start_playback(asset.clone()); }
         }
     }
-
+    
     // ─────────────────────────────────────────────────────────
     //  Sequencer tick
     // ─────────────────────────────────────────────────────────
     pub fn tick_sequencer(&self) {
         if !self.seq_playing.load(Ordering::Relaxed) { return; }
+        
         let bpm = self.seq_bpm.load(Ordering::Relaxed);
         let step_dur = std::time::Duration::from_secs_f64(60.0 / bpm as f64 / 4.0);
         let now = Instant::now();
         let should_advance = { let last = self.seq_last_step_time.read(); last.map_or(true, |t| now.duration_since(t) >= step_dur) };
         if !should_advance { return; }
         *self.seq_last_step_time.write() = Some(now);
+        
         let step = { let mut s = self.seq_current_step.write(); let cur = *s; *s = (cur + 1) % NUM_STEPS; cur };
         let mut voices: Vec<Voice> = Vec::new();
-
+        
         // Chop pad events (main sample)
         if let Some(asset) = self.current_asset.read().clone() {
             let active_pads = self.seq_grid.read()[step].clone();
@@ -229,6 +260,7 @@ impl AppState {
                 let total_frames = asset.pcm.len() / channels.max(1);
                 let pcm = Arc::new(asset.pcm.clone());
                 let chop_adsr = self.chop_adsr.read();
+                
                 for pad_idx in active_pads {
                     if let Some(mark) = marks.get(pad_idx) {
                         if mark.sample_name != asset.file_name { continue; }
@@ -239,26 +271,28 @@ impl AppState {
                 }
             }
         }
-
+        
         // Drum track events
         {
             let tracks = self.drum_tracks.read();
             for track in tracks.iter() {
                 if track.muted { continue; }
-
+                
                 // Check if this drum track has been chopped
                 let chop_marks = self.samples_manager.get_marks_for_sample(&track.asset.file_name);
-
                 if !chop_marks.is_empty() {
                     // Fire individual chops based on per-chop step rows
                     let channels = track.asset.channels as usize;
                     let total_frames = track.asset.pcm.len() / channels.max(1);
                     let pcm = Arc::new(track.asset.pcm.clone());
+                    
                     for (chop_idx, mark) in chop_marks.iter().enumerate() {
                         let fires = track.chop_steps.get(chop_idx).map(|s| s[step]).unwrap_or(false);
                         if fires {
                             let start_frame = (mark.position as f64 * total_frames as f64) as usize;
-                            voices.push(Voice::new(pcm.clone(), channels, start_frame, 1.0, track.adsr));
+                            // ✅ Use per-chop ADSR instead of track.adsr
+                            let adsr = track.chop_adsr.get(chop_idx).copied().unwrap_or(track.adsr);
+                            voices.push(Voice::new(pcm.clone(), channels, start_frame, 1.0, adsr));
                         }
                     }
                 } else if track.steps[step] {
@@ -274,12 +308,12 @@ impl AppState {
                 }
             }
         }
-
+        
         if voices.is_empty() { return; }
         self.ensure_seq_stream();
         self.seq_voice_queue.lock().unwrap().extend(voices);
     }
-
+    
     fn ensure_seq_stream(&self) {
         if self.seq_stream_handle.read().is_some() { return; }
         let host = cpal::default_host();
@@ -288,8 +322,10 @@ impl AppState {
         let cfg: cpal::StreamConfig = config.into();
         let out_channels = cfg.channels as usize;
         let sample_rate = cfg.sample_rate.0 as f32;
+        
         let seq_playing = self.seq_playing.clone();
         let voice_queue = self.seq_voice_queue.clone();
+        
         let stream = device.build_output_stream(
             &cfg,
             {
@@ -302,10 +338,13 @@ impl AppState {
                             voices.push(ev);
                         }
                     }
+                    
                     for s in data.iter_mut() { *s = 0.0; }
+                    
                     if !seq_playing.load(Ordering::Relaxed) {
                         for v in voices.iter_mut() { v.release(); }
                     }
+                    
                     let out_frames = data.len() / out_channels.max(1);
                     for voice in voices.iter_mut() {
                         for f in 0..out_frames {
@@ -325,9 +364,10 @@ impl AppState {
             |err| eprintln!("Seq stream error: {}", err),
             None,
         );
+        
         if let Ok(s) = stream { let _ = s.play(); *self.seq_stream_handle.write() = Some(s); }
     }
-
+    
     pub fn start_sequencer(&self) {
         self.seq_voice_queue.lock().unwrap().clear();
         *self.seq_stream_handle.write() = None;
@@ -336,7 +376,7 @@ impl AppState {
         self.seq_playing.store(true, Ordering::Relaxed);
         *self.status.write() = format!("Sequencer ▶ {:.0} BPM", self.seq_bpm.load(Ordering::Relaxed));
     }
-
+    
     pub fn stop_sequencer(&self) {
         self.seq_playing.store(false, Ordering::Relaxed);
         *self.seq_stream_handle.write() = None;
@@ -344,7 +384,7 @@ impl AppState {
         *self.seq_current_step.write() = 0;
         *self.status.write() = "Sequencer stopped".to_string();
     }
-
+    
     /// Returns (asset, waveform) for whichever row is focused in the waveform display.
     pub fn focused_display(&self) -> (Option<Arc<AudioAsset>>, Option<WaveformAnalysis>) {
         match self.waveform_focus.read().clone() {
@@ -374,21 +414,26 @@ fn build_stream<T: cpal::Sample + SizedSample + FromSample<f32> + 'static>(
     let ch = args.channels as usize; let total = args.total_samples; let pcm = args.pcm;
     let err_status = args.status.clone(); let err_playing = args.is_playing.clone();
     let err_fn = move |err| { eprintln!("Audio error: {}", err); *err_status.write() = format!("Playback error: {}", err); err_playing.store(false, Ordering::Relaxed); };
+    
     let d_status = args.status; let d_playing = args.is_playing; let d_pos = args.position;
     let d_idx = args.sample_index; let d_stop = args.stop_target;
     let init = d_idx.load(Ordering::Relaxed) as f64 / ch.max(1) as f64;
+    
     let stream = device.build_output_stream(config, {
         let mut fp = init;
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             if !d_playing.load(Ordering::Relaxed) { for d in data.iter_mut() { *d = T::from_sample(0.0f32); } return; }
+            
             let frames = data.len() / ch.max(1); let pcm_frames = pcm.len() / ch.max(1);
             let stop_pos = d_stop.load(Ordering::Relaxed);
             let target = if stop_pos >= 0.0 { Some((stop_pos * pcm_frames as f32) as usize) } else { None };
+            
             let mut out = 0usize;
             'outer: for _ in 0..frames {
                 let i0 = fp as usize;
                 if let Some(t) = target { if i0 >= t { d_playing.store(false, Ordering::Relaxed); *d_status.write() = "Stopped at marker".to_string(); break 'outer; } }
                 if i0 >= pcm_frames.saturating_sub(1) { d_playing.store(false, Ordering::Relaxed); *d_status.write() = "Playback finished".to_string(); break 'outer; }
+                
                 let i1 = (i0 + 1).min(pcm_frames - 1); let t = (fp - i0 as f64) as f32;
                 for c in 0..ch {
                     let s0 = pcm.get(i0 * ch + c).copied().unwrap_or(0.0);
@@ -403,7 +448,8 @@ fn build_stream<T: cpal::Sample + SizedSample + FromSample<f32> + 'static>(
             d_idx.store((fp * ch as f64) as u64, Ordering::Relaxed);
         }
     }, err_fn, None)?;
+    
     Ok(stream)
 }
 
-pub mod view;
+pub mod ui;
