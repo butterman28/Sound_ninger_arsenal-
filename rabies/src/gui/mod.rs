@@ -1,3 +1,4 @@
+// src/gui/mod.rs
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -8,17 +9,18 @@ use atomic_float::AtomicF32;
 use crate::audio::{AudioAsset, AudioManager, WaveformAnalysis};
 use crate::samples::{SamplesManager, PlaybackMode};
 use crate::adsr::{ADSREnvelope, Voice};
+
 pub const NUM_STEPS: usize = 16;
 
 /// One independently-loaded sample as a sequencer row.
 pub struct DrumTrack {
     pub asset: Arc<AudioAsset>,
     pub waveform: Option<WaveformAnalysis>,
-    pub steps: [bool; NUM_STEPS],           // whole-sample step row (used when no chops)
-    pub chop_steps: Vec<[bool; NUM_STEPS]>, // per-chop step rows (used when chopped)
-    pub chop_adsr: Vec<ADSREnvelope>,       // ✅ NEW: Individual ADSR per chop
+    pub steps: [bool; NUM_STEPS],
+    pub chop_steps: Vec<[bool; NUM_STEPS]>,
+    pub chop_adsr: Vec<ADSREnvelope>,
     pub muted: bool,
-    pub adsr: ADSREnvelope,                 // Default/fallback ADSR
+    pub adsr: ADSREnvelope,
 }
 
 impl DrumTrack {
@@ -28,20 +30,18 @@ impl DrumTrack {
             waveform,
             steps: [false; NUM_STEPS],
             chop_steps: Vec::new(),
-            chop_adsr: Vec::new(),  // ✅ NEW
+            chop_adsr: Vec::new(),
             muted: false,
             adsr: ADSREnvelope::default(),
         }
     }
     
-    /// Grow chop_steps and chop_adsr so they have at least `needed` rows.
     pub fn ensure_chop_steps(&mut self, needed: usize) {
         while self.chop_steps.len() < needed {
             self.chop_steps.push([false; NUM_STEPS]);
         }
-        // ✅ NEW: Ensure chop_adsr matches chop count
         while self.chop_adsr.len() < needed {
-            self.chop_adsr.push(self.adsr); // Copy default ADSR for new chops
+            self.chop_adsr.push(self.adsr);
         }
     }
 }
@@ -68,29 +68,27 @@ pub struct AppState {
     pub(crate) dragged_mark_index: Arc<RwLock<Option<usize>>>,
     pub(crate) selected_from_marker: Arc<RwLock<Option<usize>>>,
     pub(crate) selected_to_marker: Arc<RwLock<Option<usize>>>,
-    // Chop sequencer grid (pads on main sample)
     pub seq_grid: Arc<RwLock<Vec<Vec<usize>>>>,
-    // ADSR for each chop (indexed by pad_idx)
     pub chop_adsr: Arc<RwLock<Vec<ADSREnvelope>>>,
-    // Multi-sample drum tracks
     pub drum_tracks: Arc<RwLock<Vec<DrumTrack>>>,
+    pub(crate) active_voices: Arc<std::sync::Mutex<Vec<Voice>>>,
     pub drum_loading: Arc<AtomicBool>,
-    // Sequencer engine
     pub seq_bpm: Arc<AtomicF32>,
     pub seq_playing: Arc<AtomicBool>,
     pub seq_current_step: Arc<RwLock<usize>>,
     pub seq_last_step_time: Arc<RwLock<Option<Instant>>>,
     pub(crate) seq_stream_handle: Arc<RwLock<Option<cpal::Stream>>>,
     pub(crate) seq_voice_queue: Arc<std::sync::Mutex<Vec<Voice>>>,
-    // Which asset the waveform display shows
     pub waveform_focus: Arc<RwLock<WaveformFocus>>,
     pub piano_roll_open: Arc<RwLock<bool>>,
+    pub main_track_index: Arc<RwLock<Option<usize>>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
             audio_manager: Arc::new(AudioManager::new()),
+            active_voices: Arc::new(std::sync::Mutex::new(Vec::new())),
             samples_manager: Arc::new(SamplesManager::new()),
             current_asset: Arc::new(RwLock::new(None)),
             waveform_analysis: Arc::new(RwLock::new(None)),
@@ -117,6 +115,7 @@ impl Default for AppState {
             seq_voice_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             waveform_focus: Arc::new(RwLock::new(WaveformFocus::MainSample)),
             piano_roll_open: Arc::new(RwLock::new(false)),
+            main_track_index: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -171,15 +170,14 @@ impl AppState {
             Err(e) => { *self.status.write() = format!("Stream error: {}", e); self.is_playing.store(false, Ordering::Relaxed); }
         }
     }
-    
+
     pub fn stop_playback(&self) {
         self.is_playing.store(false, Ordering::Relaxed);
         *self.stream_handle.write() = None;
         *self.playback_asset.write() = None;
     }
-    
+
     pub fn toggle_playback(&self) {
-        // 1. Determine which asset to play based on current waveform focus
         let asset_to_play = {
             let focus = self.waveform_focus.read();
             match &*focus {
@@ -191,19 +189,14 @@ impl AppState {
             }
         };
         
-        // 2. Proceed only if we have an asset
         if let Some(asset) = asset_to_play {
             if self.is_playing.load(Ordering::Relaxed) {
-                // Pause
                 self.is_playing.store(false, Ordering::Relaxed);
                 *self.status.write() = format!("Paused: {}", asset.file_name);
             } else {
-                // Play
-                // Handle seek logic based on mode (existing logic preserved)
                 if let PlaybackMode::CustomRegion { region_id } = self.samples_manager.get_playback_mode() {
                     if let Some(region) = self.samples_manager.get_region_by_id(region_id) {
                         if let Some(mark) = self.samples_manager.get_mark_by_id(region.from) {
-                            // Only seek if the mark belongs to the current asset
                             if mark.sample_name == asset.file_name {
                                 self.playback_position.store(mark.position, Ordering::Relaxed);
                                 let sp = (mark.position as f64 * asset.pcm.len() as f64) as u64;
@@ -215,13 +208,11 @@ impl AppState {
                     self.playback_position.store(0.0, Ordering::Relaxed);
                     self.playback_sample_index.store(0, Ordering::Relaxed);
                 }
-                
-                // Start playback with the selected asset
                 self.start_playback(asset);
             }
         }
     }
-    
+
     pub fn seek_to(&self, normalized_pos: f32) {
         if let Some(asset) = self.current_asset.read().as_ref() {
             let was_playing = self.is_playing.load(Ordering::Relaxed);
@@ -234,24 +225,97 @@ impl AppState {
             if was_playing { self.start_playback(asset.clone()); }
         }
     }
-    
-    // ─────────────────────────────────────────────────────────
-    //  Sequencer tick
-    // ─────────────────────────────────────────────────────────
+
+    pub fn load_sample_as_track(&self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Audio", &["mp3","wav","flac","ogg","m4a","aac"])
+            .pick_file()
+        {
+            let audio_manager = self.audio_manager.clone();
+            let drum_tracks = self.drum_tracks.clone();
+            let drum_loading = self.drum_loading.clone();
+            let status = self.status.clone();
+            let waveform_focus = self.waveform_focus.clone();
+            let main_track_index = self.main_track_index.clone();
+            let waveform_analysis = self.waveform_analysis.clone();
+            
+            drum_loading.store(true, Ordering::Relaxed);
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    audio_manager.load_audio(path.to_str().unwrap_or(""))
+                }));
+                match result {
+                    Ok(Ok(asset)) => {
+                        let waveform = audio_manager.analyze_waveform(&asset, 400);
+                        let track = DrumTrack::new(asset.clone(), Some(waveform.clone()));
+                        let track_idx = {
+                            let mut tracks = drum_tracks.write();
+                            tracks.push(track);
+                            tracks.len() - 1
+                        };
+                        *waveform_focus.write() = WaveformFocus::DrumTrack(track_idx);
+                        *waveform_analysis.write() = Some(waveform);
+                        *main_track_index.write() = Some(track_idx);
+                        *status.write() = format!("✓ Track loaded: {} — click label to focus, ▶ Preview + M to chop", asset.file_name);
+                    }
+                    Ok(Err(e)) => { *status.write() = format!("✗ Track load error: {}", e); }
+                    Err(_) => { *status.write() = "✗ Track load crashed".to_string(); }
+                }
+                drum_loading.store(false, Ordering::Relaxed);
+            });
+        }
+    }
+
+    pub fn load_drum_track(&self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Audio", &["mp3","wav","flac","ogg","m4a","aac"])
+            .pick_file()
+        {
+            let audio_manager = self.audio_manager.clone();
+            let drum_tracks = self.drum_tracks.clone();
+            let drum_loading = self.drum_loading.clone();
+            let status = self.status.clone();
+            drum_loading.store(true, Ordering::Relaxed);
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    audio_manager.load_audio(path.to_str().unwrap_or(""))
+                }));
+                match result {
+                    Ok(Ok(asset)) => {
+                        let waveform = audio_manager.analyze_waveform(&asset, 400);
+                        let track = DrumTrack::new(asset.clone(), Some(waveform));
+                        drum_tracks.write().push(track);
+                        *status.write() = format!("✓ Track added: {} — click label to focus, ▶ Preview + M to chop", asset.file_name);
+                    }
+                    Ok(Err(e)) => { *status.write() = format!("✗ Track load error: {}", e); }
+                    Err(_) => { *status.write() = "✗ Track load crashed".to_string(); }
+                }
+                drum_loading.store(false, Ordering::Relaxed);
+            });
+        }
+    }
+
+    pub fn switch_to_track(&self, track_idx: usize) {
+        let tracks = self.drum_tracks.read();
+        if let Some(track) = tracks.get(track_idx) {
+            *self.waveform_focus.write() = WaveformFocus::DrumTrack(track_idx);
+            *self.waveform_analysis.write() = track.waveform.clone();
+            *self.status.write() = format!("Viewing: {}", track.asset.file_name);
+        }
+    }
+
     pub fn tick_sequencer(&self) {
         if !self.seq_playing.load(Ordering::Relaxed) { return; }
-        
         let bpm = self.seq_bpm.load(Ordering::Relaxed);
         let step_dur = std::time::Duration::from_secs_f64(60.0 / bpm as f64 / 4.0);
         let now = Instant::now();
         let should_advance = { let last = self.seq_last_step_time.read(); last.map_or(true, |t| now.duration_since(t) >= step_dur) };
         if !should_advance { return; }
         *self.seq_last_step_time.write() = Some(now);
-        
         let step = { let mut s = self.seq_current_step.write(); let cur = *s; *s = (cur + 1) % NUM_STEPS; cur };
+        
         let mut voices: Vec<Voice> = Vec::new();
         
-        // Chop pad events (main sample)
         if let Some(asset) = self.current_asset.read().clone() {
             let active_pads = self.seq_grid.read()[step].clone();
             if !active_pads.is_empty() {
@@ -260,7 +324,6 @@ impl AppState {
                 let total_frames = asset.pcm.len() / channels.max(1);
                 let pcm = Arc::new(asset.pcm.clone());
                 let chop_adsr = self.chop_adsr.read();
-                
                 for pad_idx in active_pads {
                     if let Some(mark) = marks.get(pad_idx) {
                         if mark.sample_name != asset.file_name { continue; }
@@ -272,48 +335,40 @@ impl AppState {
             }
         }
         
-        // Drum track events
         {
             let tracks = self.drum_tracks.read();
-            for track in tracks.iter() {
+            let main_idx = *self.main_track_index.read();
+            for (track_idx, track) in tracks.iter().enumerate() {
                 if track.muted { continue; }
-                
-                // Check if this drum track has been chopped
                 let chop_marks = self.samples_manager.get_marks_for_sample(&track.asset.file_name);
                 if !chop_marks.is_empty() {
-                    // Fire individual chops based on per-chop step rows
                     let channels = track.asset.channels as usize;
                     let total_frames = track.asset.pcm.len() / channels.max(1);
                     let pcm = Arc::new(track.asset.pcm.clone());
-                    
                     for (chop_idx, mark) in chop_marks.iter().enumerate() {
-                        let fires = track.chop_steps.get(chop_idx).map(|s| s[step]).unwrap_or(false);
+                        let fires = if Some(track_idx) == main_idx {
+                            self.seq_grid.read()[step].contains(&chop_idx)
+                        } else {
+                            track.chop_steps.get(chop_idx).map(|s| s[step]).unwrap_or(false)
+                        };
                         if fires {
                             let start_frame = (mark.position as f64 * total_frames as f64) as usize;
-                            // ✅ Use per-chop ADSR instead of track.adsr
                             let adsr = track.chop_adsr.get(chop_idx).copied().unwrap_or(track.adsr);
                             voices.push(Voice::new(pcm.clone(), channels, start_frame, 1.0, adsr));
                         }
                     }
                 } else if track.steps[step] {
-                    // No chops — fire the whole sample
                     let channels = track.asset.channels as usize;
-                    voices.push(Voice::new(
-                        Arc::new(track.asset.pcm.clone()),
-                        channels,
-                        0,
-                        1.0,
-                        track.adsr,
-                    ));
+                    voices.push(Voice::new(Arc::new(track.asset.pcm.clone()), channels, 0, 1.0, track.adsr));
                 }
             }
         }
         
         if voices.is_empty() { return; }
         self.ensure_seq_stream();
-        self.seq_voice_queue.lock().unwrap().extend(voices);
+        self.active_voices.lock().unwrap().extend(voices);
     }
-    
+
     fn ensure_seq_stream(&self) {
         if self.seq_stream_handle.read().is_some() { return; }
         let host = cpal::default_host();
@@ -322,33 +377,37 @@ impl AppState {
         let cfg: cpal::StreamConfig = config.into();
         let out_channels = cfg.channels as usize;
         let sample_rate = cfg.sample_rate.0 as f32;
-        
         let seq_playing = self.seq_playing.clone();
         let voice_queue = self.seq_voice_queue.clone();
         
         let stream = device.build_output_stream(
             &cfg,
             {
-                let mut voices: Vec<Voice> = Vec::with_capacity(24);
+                // Capture shared state
+                let active_voices = self.active_voices.clone();
+                let seq_playing = self.seq_playing.clone();
+                
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    {
-                        let mut q = voice_queue.lock().unwrap();
-                        for ev in q.drain(..) {
-                            if voices.len() >= 16 { voices.remove(0); }
-                            voices.push(ev);
-                        }
-                    }
-                    
+                    // Zero output buffer first
                     for s in data.iter_mut() { *s = 0.0; }
                     
+                    // Lock active voices briefly
+                    let mut voices = active_voices.lock().unwrap();
+                    
+                    // If sequencer stopped, release all voices
                     if !seq_playing.load(Ordering::Relaxed) {
                         for v in voices.iter_mut() { v.release(); }
                     }
                     
                     let out_frames = data.len() / out_channels.max(1);
-                    for voice in voices.iter_mut() {
+                    
+                    // Render each active voice, retain if still playing
+                    voices.retain_mut(|voice| {
+                        let mut still_active = false;
+                        
                         for f in 0..out_frames {
                             if let Some(samples) = voice.render(sample_rate, out_channels) {
+                                still_active = true; // Voice produced audio this frame
                                 for (oc, smp) in samples.iter().enumerate() {
                                     let oi = f * out_channels + oc;
                                     if oi < data.len() {
@@ -357,17 +416,17 @@ impl AppState {
                                 }
                             }
                         }
-                    }
-                    voices.retain(|v| !v.is_finished());
+                        still_active // Keep voice only if it's still producing audio
+                    });
+                    // Mutex guard drops here automatically
                 }
             },
             |err| eprintln!("Seq stream error: {}", err),
             None,
         );
-        
         if let Ok(s) = stream { let _ = s.play(); *self.seq_stream_handle.write() = Some(s); }
     }
-    
+
     pub fn start_sequencer(&self) {
         self.seq_voice_queue.lock().unwrap().clear();
         *self.seq_stream_handle.write() = None;
@@ -376,16 +435,16 @@ impl AppState {
         self.seq_playing.store(true, Ordering::Relaxed);
         *self.status.write() = format!("Sequencer ▶ {:.0} BPM", self.seq_bpm.load(Ordering::Relaxed));
     }
-    
+
     pub fn stop_sequencer(&self) {
         self.seq_playing.store(false, Ordering::Relaxed);
         *self.seq_stream_handle.write() = None;
         self.seq_voice_queue.lock().unwrap().clear();
+        self.active_voices.lock().unwrap().clear(); // ← ADD THIS
         *self.seq_current_step.write() = 0;
         *self.status.write() = "Sequencer stopped".to_string();
     }
-    
-    /// Returns (asset, waveform) for whichever row is focused in the waveform display.
+
     pub fn focused_display(&self) -> (Option<Arc<AudioAsset>>, Option<WaveformAnalysis>) {
         match self.waveform_focus.read().clone() {
             WaveformFocus::MainSample => (self.current_asset.read().clone(), self.waveform_analysis.read().clone()),
@@ -414,41 +473,32 @@ fn build_stream<T: cpal::Sample + SizedSample + FromSample<f32> + 'static>(
     let ch = args.channels as usize; let total = args.total_samples; let pcm = args.pcm;
     let err_status = args.status.clone(); let err_playing = args.is_playing.clone();
     let err_fn = move |err| { eprintln!("Audio error: {}", err); *err_status.write() = format!("Playback error: {}", err); err_playing.store(false, Ordering::Relaxed); };
-    
     let d_status = args.status; let d_playing = args.is_playing; let d_pos = args.position;
     let d_idx = args.sample_index; let d_stop = args.stop_target;
-    let init = d_idx.load(Ordering::Relaxed) as f64 / ch.max(1) as f64;
-    
-    let stream = device.build_output_stream(config, {
-        let mut fp = init;
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            if !d_playing.load(Ordering::Relaxed) { for d in data.iter_mut() { *d = T::from_sample(0.0f32); } return; }
-            
-            let frames = data.len() / ch.max(1); let pcm_frames = pcm.len() / ch.max(1);
-            let stop_pos = d_stop.load(Ordering::Relaxed);
-            let target = if stop_pos >= 0.0 { Some((stop_pos * pcm_frames as f32) as usize) } else { None };
-            
-            let mut out = 0usize;
-            'outer: for _ in 0..frames {
-                let i0 = fp as usize;
-                if let Some(t) = target { if i0 >= t { d_playing.store(false, Ordering::Relaxed); *d_status.write() = "Stopped at marker".to_string(); break 'outer; } }
-                if i0 >= pcm_frames.saturating_sub(1) { d_playing.store(false, Ordering::Relaxed); *d_status.write() = "Playback finished".to_string(); break 'outer; }
-                
-                let i1 = (i0 + 1).min(pcm_frames - 1); let t = (fp - i0 as f64) as f32;
-                for c in 0..ch {
-                    let s0 = pcm.get(i0 * ch + c).copied().unwrap_or(0.0);
-                    let s1 = pcm.get(i1 * ch + c).copied().unwrap_or(0.0);
-                    if out < data.len() { data[out] = T::from_sample(s0 + t * (s1 - s0)); }
-                    out += 1;
-                }
-                fp += 1.0;
+    let stream = device.build_output_stream(config, move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+    let mut fp = d_idx.load(Ordering::Relaxed) as f64 / ch.max(1) as f64;
+        if !d_playing.load(Ordering::Relaxed) { for d in data.iter_mut() { *d = T::from_sample(0.0f32); } return; }
+        let frames = data.len() / ch.max(1); let pcm_frames = pcm.len() / ch.max(1);
+        let stop_pos = d_stop.load(Ordering::Relaxed);
+        let target = if stop_pos >= 0.0 { Some((stop_pos * pcm_frames as f32) as usize) } else { None };
+        let mut out = 0usize;
+        'outer: for _ in 0..frames {
+            let i0 = fp as usize;
+            if let Some(t) = target { if i0 >= t { d_playing.store(false, Ordering::Relaxed); *d_status.write() = "Stopped at marker".to_string(); break 'outer; } }
+            if i0 >= pcm_frames.saturating_sub(1) { d_playing.store(false, Ordering::Relaxed); *d_status.write() = "Playback finished".to_string(); break 'outer; }
+            let i1 = (i0 + 1).min(pcm_frames - 1); let t = (fp - i0 as f64) as f32;
+            for c in 0..ch {
+                let s0 = pcm.get(i0 * ch + c).copied().unwrap_or(0.0);
+                let s1 = pcm.get(i1 * ch + c).copied().unwrap_or(0.0);
+                if out < data.len() { data[out] = T::from_sample(s0 + t * (s1 - s0)); }
+                out += 1;
             }
-            for d in data.iter_mut().skip(out) { *d = T::from_sample(0.0f32); }
-            if total > 0 { d_pos.store((fp * ch as f64 / total as f64).min(1.0) as f32, Ordering::Relaxed); }
-            d_idx.store((fp * ch as f64) as u64, Ordering::Relaxed);
+            fp += 1.0;
         }
+        for d in data.iter_mut().skip(out) { *d = T::from_sample(0.0f32); }
+        if total > 0 { d_pos.store((fp * ch as f64 / total as f64).min(1.0) as f32, Ordering::Relaxed); }
+        d_idx.store((fp * ch as f64) as u64, Ordering::Relaxed);
     }, err_fn, None)?;
-    
     Ok(stream)
 }
 

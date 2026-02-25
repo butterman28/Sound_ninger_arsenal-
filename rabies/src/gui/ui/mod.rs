@@ -9,4 +9,3 @@ pub mod view;
 // Remove: pub use view::AppState;
 
 // ✅ Re-export widgets helpers for convenience
-pub use widgets::*;
