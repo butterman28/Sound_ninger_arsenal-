@@ -305,127 +305,140 @@ impl AppState {
     }
 
     pub fn tick_sequencer(&self) {
-        if !self.seq_playing.load(Ordering::Relaxed) { return; }
-        let bpm = self.seq_bpm.load(Ordering::Relaxed);
-        let step_dur = std::time::Duration::from_secs_f64(60.0 / bpm as f64 / 4.0);
-        let now = Instant::now();
-        let should_advance = { let last = self.seq_last_step_time.read(); last.map_or(true, |t| now.duration_since(t) >= step_dur) };
-        if !should_advance { return; }
-        *self.seq_last_step_time.write() = Some(now);
-        let step = { let mut s = self.seq_current_step.write(); let cur = *s; *s = (cur + 1) % NUM_STEPS; cur };
-        
-        let mut voices: Vec<Voice> = Vec::new();
-        
-        if let Some(asset) = self.current_asset.read().clone() {
-            let active_pads = self.seq_grid.read()[step].clone();
-            if !active_pads.is_empty() {
-                let marks = self.samples_manager.get_marks();
-                let channels = asset.channels as usize;
-                let total_frames = asset.pcm.len() / channels.max(1);
-                let pcm = Arc::new(asset.pcm.clone());
-                let chop_adsr = self.chop_adsr.read();
-                for pad_idx in active_pads {
-                    if let Some(mark) = marks.get(pad_idx) {
-                        if mark.sample_name != asset.file_name { continue; }
+    if !self.seq_playing.load(Ordering::Relaxed) { return; }
+    let bpm = self.seq_bpm.load(Ordering::Relaxed);
+    let step_dur = std::time::Duration::from_secs_f64(60.0 / bpm as f64 / 4.0);
+    let now = Instant::now();
+    let should_advance = { let last = self.seq_last_step_time.read(); last.map_or(true, |t| now.duration_since(t) >= step_dur) };
+    if !should_advance { return; }
+    *self.seq_last_step_time.write() = Some(now);
+    let step = { let mut s = self.seq_current_step.write(); let cur = *s; *s = (cur + 1) % NUM_STEPS; cur };
+    
+    let mut voices: Vec<Voice> = Vec::new();
+    
+    // main sample chops
+    if let Some(asset) = self.current_asset.read().clone() {
+        let active_pads = self.seq_grid.read()[step].clone();
+        if !active_pads.is_empty() {
+            let marks = self.samples_manager.get_marks();
+            let channels = asset.channels as usize;
+            let total_frames = asset.pcm.len() / channels.max(1);
+            let pcm = Arc::new(asset.pcm.clone());
+            let chop_adsr = self.chop_adsr.read();
+            for pad_idx in active_pads {
+                if let Some(mark) = marks.get(pad_idx) {
+                    if mark.sample_name != asset.file_name { continue; }
+                    let start_frame = (mark.position as f64 * total_frames as f64) as usize;
+                    let adsr = chop_adsr.get(pad_idx).copied().unwrap_or_default();
+                    voices.push(Voice::new(pcm.clone(), channels, start_frame, 1.0, adsr));
+                }
+            }
+        }
+    }
+    
+    // Drum track chops
+    {
+        let tracks = self.drum_tracks.read();
+        let main_idx = *self.main_track_index.read();
+        for (track_idx, track) in tracks.iter().enumerate() {
+            if track.muted { continue; }
+            let chop_marks = self.samples_manager.get_marks_for_sample(&track.asset.file_name);
+            if !chop_marks.is_empty() {
+                let channels = track.asset.channels as usize;
+                let total_frames = track.asset.pcm.len() / channels.max(1);
+                let pcm = Arc::new(track.asset.pcm.clone());
+                for (chop_idx, mark) in chop_marks.iter().enumerate() {
+                    let fires = if Some(track_idx) == main_idx {
+                        self.seq_grid.read()[step].contains(&chop_idx)
+                    } else {
+                        track.chop_steps.get(chop_idx).map(|s| s[step]).unwrap_or(false)
+                    };
+                    if fires {
                         let start_frame = (mark.position as f64 * total_frames as f64) as usize;
-                        let adsr = chop_adsr.get(pad_idx).copied().unwrap_or_default();
+                        let adsr = track.chop_adsr.get(chop_idx).copied().unwrap_or(track.adsr);
                         voices.push(Voice::new(pcm.clone(), channels, start_frame, 1.0, adsr));
                     }
                 }
+            } else if track.steps[step] {
+                let channels = track.asset.channels as usize;
+                voices.push(Voice::new(Arc::new(track.asset.pcm.clone()), channels, 0, 1.0, track.adsr));
             }
         }
-        
-        {
-            let tracks = self.drum_tracks.read();
-            let main_idx = *self.main_track_index.read();
-            for (track_idx, track) in tracks.iter().enumerate() {
-                if track.muted { continue; }
-                let chop_marks = self.samples_manager.get_marks_for_sample(&track.asset.file_name);
-                if !chop_marks.is_empty() {
-                    let channels = track.asset.channels as usize;
-                    let total_frames = track.asset.pcm.len() / channels.max(1);
-                    let pcm = Arc::new(track.asset.pcm.clone());
-                    for (chop_idx, mark) in chop_marks.iter().enumerate() {
-                        let fires = if Some(track_idx) == main_idx {
-                            self.seq_grid.read()[step].contains(&chop_idx)
-                        } else {
-                            track.chop_steps.get(chop_idx).map(|s| s[step]).unwrap_or(false)
-                        };
-                        if fires {
-                            let start_frame = (mark.position as f64 * total_frames as f64) as usize;
-                            let adsr = track.chop_adsr.get(chop_idx).copied().unwrap_or(track.adsr);
-                            voices.push(Voice::new(pcm.clone(), channels, start_frame, 1.0, adsr));
-                        }
-                    }
-                } else if track.steps[step] {
-                    let channels = track.asset.channels as usize;
-                    voices.push(Voice::new(Arc::new(track.asset.pcm.clone()), channels, 0, 1.0, track.adsr));
-                }
-            }
-        }
-        
-        if voices.is_empty() { return; }
-        self.ensure_seq_stream();
-        self.active_voices.lock().unwrap().extend(voices);
     }
+    
+    // ✅ Add voices to active list (audio callback only renders, doesn't create)
+    if !voices.is_empty() {
+        self.ensure_seq_stream();
+        if let Ok(mut active) = self.active_voices.lock() {
+            active.extend(voices);
+        }
+    }
+}
 
     fn ensure_seq_stream(&self) {
-        if self.seq_stream_handle.read().is_some() { return; }
-        let host = cpal::default_host();
-        let device = match host.default_output_device() { Some(d) => d, None => return };
-        let config = match device.default_output_config() { Ok(c) => c, Err(_) => return };
-        let cfg: cpal::StreamConfig = config.into();
-        let out_channels = cfg.channels as usize;
-        let sample_rate = cfg.sample_rate.0 as f32;
-        let seq_playing = self.seq_playing.clone();
-        let voice_queue = self.seq_voice_queue.clone();
-        
-        let stream = device.build_output_stream(
-            &cfg,
-            {
-                // Capture shared state
-                let active_voices = self.active_voices.clone();
-                let seq_playing = self.seq_playing.clone();
+    if self.seq_stream_handle.read().is_some() { return; }
+    let host = cpal::default_host();
+    let device = match host.default_output_device() { Some(d) => d, None => return };
+    
+    // ✅ FIXED: Use default_output_config() which returns SupportedStreamConfig
+    // (not SupportedStreamConfigRange)
+    let config = match device.default_output_config() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    
+    // ✅ Convert SupportedStreamConfig to StreamConfig
+    let mut cfg: cpal::StreamConfig = config.clone().into();
+    cfg.buffer_size = cpal::BufferSize::Fixed(1024); // Larger buffer to prevent underruns
+    cfg.sample_rate = cpal::SampleRate(48000);
+    
+    let out_channels = cfg.channels as usize;
+    let sample_rate = cfg.sample_rate.0 as f32;
+    let seq_playing = self.seq_playing.clone();
+    
+    let stream = device.build_output_stream(
+        &cfg,
+        {
+            let active_voices = self.active_voices.clone();
+            let seq_playing = self.seq_playing.clone();
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                // Zero output buffer first
+                for s in data.iter_mut() { *s = 0.0; }
                 
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    // Zero output buffer first
-                    for s in data.iter_mut() { *s = 0.0; }
-                    
-                    // Lock active voices briefly
-                    let mut voices = active_voices.lock().unwrap();
-                    
-                    // If sequencer stopped, release all voices
-                    if !seq_playing.load(Ordering::Relaxed) {
-                        for v in voices.iter_mut() { v.release(); }
-                    }
-                    
-                    let out_frames = data.len() / out_channels.max(1);
-                    
-                    // Render each active voice, retain if still playing
-                    voices.retain_mut(|voice| {
-                        let mut still_active = false;
-                        
-                        for f in 0..out_frames {
-                            if let Some(samples) = voice.render(sample_rate, out_channels) {
-                                still_active = true; // Voice produced audio this frame
-                                for (oc, smp) in samples.iter().enumerate() {
-                                    let oi = f * out_channels + oc;
-                                    if oi < data.len() {
-                                        data[oi] = (data[oi] + smp).clamp(-1.0, 1.0);
-                                    }
+                // Quick exit if not playing
+                if !seq_playing.load(Ordering::Relaxed) { return; }
+                
+                // Lock voices briefly, render, release
+                let mut voices = match active_voices.lock() {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                
+                let out_frames = data.len() / out_channels.max(1);
+                
+                // Render voices in place, remove finished ones
+                voices.retain_mut(|voice| {
+                    let mut still_active = false;
+                    for f in 0..out_frames {
+                        if let Some(samples) = voice.render(sample_rate, out_channels) {
+                            still_active = true;
+                            for (oc, smp) in samples.iter().enumerate() {
+                                let oi = f * out_channels + oc;
+                                if oi < data.len() {
+                                    data[oi] = (data[oi] + smp).clamp(-1.0, 1.0);
                                 }
                             }
                         }
-                        still_active // Keep voice only if it's still producing audio
-                    });
-                    // Mutex guard drops here automatically
-                }
-            },
-            |err| eprintln!("Seq stream error: {}", err),
-            None,
-        );
-        if let Ok(s) = stream { let _ = s.play(); *self.seq_stream_handle.write() = Some(s); }
-    }
+                    }
+                    still_active
+                });
+            }
+        },
+        |err| eprintln!("Seq stream error: {}", err),
+        None,
+    );
+    if let Ok(s) = stream { let _ = s.play(); *self.seq_stream_handle.write() = Some(s); }
+}
 
     pub fn start_sequencer(&self) {
         self.seq_voice_queue.lock().unwrap().clear();
@@ -437,13 +450,18 @@ impl AppState {
     }
 
     pub fn stop_sequencer(&self) {
-        self.seq_playing.store(false, Ordering::Relaxed);
-        *self.seq_stream_handle.write() = None;
-        self.seq_voice_queue.lock().unwrap().clear();
-        self.active_voices.lock().unwrap().clear(); // ← ADD THIS
-        *self.seq_current_step.write() = 0;
-        *self.status.write() = "Sequencer stopped".to_string();
+    self.seq_playing.store(false, Ordering::Relaxed);
+    *self.seq_stream_handle.write() = None;
+    self.seq_voice_queue.lock().unwrap().clear();
+    
+    // Clear voices quickly
+    if let Ok(mut voices) = self.active_voices.lock() {
+        voices.clear();
     }
+    
+    *self.seq_current_step.write() = 0;
+    *self.status.write() = "Sequencer stopped".to_string();
+}
 
     pub fn focused_display(&self) -> (Option<Arc<AudioAsset>>, Option<WaveformAnalysis>) {
         match self.waveform_focus.read().clone() {
