@@ -118,11 +118,10 @@ impl eframe::App for AppState {
                         "Waveform".to_string()
                     }
                 };
-                ui.group(|ui| {
+                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&focus_label).small().color(egui::Color32::from_gray(170)));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Preview button for focused track
                             if let WaveformFocus::DrumTrack(idx) = &focus {
                                 let asset_opt = {
                                     let tracks = self.drum_tracks.read();
@@ -139,9 +138,8 @@ impl eframe::App for AppState {
                                     if ui.add(egui::Button::new(
                                         egui::RichText::new(btn_label).small().color(btn_color)
                                     )).clicked() {
-                                        if is_playing {
-                                            self.stop_playback();
-                                        } else {
+                                        if is_playing { self.stop_playback(); }
+                                        else {
                                             self.playback_position.store(0.0, Ordering::Relaxed);
                                             self.playback_sample_index.store(0, Ordering::Relaxed);
                                             self.start_playback(drum_asset);
@@ -156,11 +154,12 @@ impl eframe::App for AppState {
                     let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
                     let rect = response.rect;
                     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(22));
+
                     let (focused_asset, focused_waveform) = self.focused_display();
                     if let Some(analysis) = focused_waveform.as_ref() {
                         let cy = rect.center().y;
                         let hs = rect.height() * 0.45;
-                        let w = rect.width();
+                        let w  = rect.width();
                         let bc = analysis.min_max_buckets.len();
                         let bw = (w / bc as f32).max(1.0);
                         let wave_color = if let WaveformFocus::DrumTrack(idx) = &focus {
@@ -168,19 +167,28 @@ impl eframe::App for AppState {
                         } else {
                             egui::Color32::from_rgb(80, 160, 255)
                         };
+
+                        // ── Draw waveform bars ────────────────────────────
                         for (i, (min, max)) in analysis.min_max_buckets.iter().enumerate() {
-                            let x = rect.left() + i as f32 * bw;
+                            let x    = rect.left() + i as f32 * bw;
                             let peak = max.abs().max(min.abs());
-                            let bh = (peak * hs * 2.0).min(rect.height() * 0.9);
-                            let bt = cy - bh / 2.0;
+                            let bh   = (peak * hs * 2.0).min(rect.height() * 0.9);
+                            let bt   = cy - bh / 2.0;
                             painter.rect_filled(
                                 egui::Rect::from_min_max(egui::pos2(x, bt), egui::pos2(x + bw - 0.5, bt + bh)),
                                 0.0, wave_color,
                             );
                         }
                         painter.hline(rect.x_range(), cy, egui::Stroke::new(0.5, egui::Color32::from_gray(55)));
-                        
-                        // Chop markers for focused track
+
+                        // ── Gather marks + pointer state ──────────────────
+                        let pointer_pos  = ui.input(|i| i.pointer.hover_pos());
+                        let ptr_pressed  = ui.input(|i| i.pointer.primary_pressed());
+                        let ptr_down     = ui.input(|i| i.pointer.primary_down());
+                        let ptr_released = ui.input(|i| i.pointer.primary_released());
+
+                        const HIT_PX: f32 = 8.0; // pixels either side counts as a hit
+
                         if let WaveformFocus::DrumTrack(drum_idx) = &focus {
                             let file_name_opt = {
                                 let tracks = self.drum_tracks.read();
@@ -188,21 +196,126 @@ impl eframe::App for AppState {
                             };
                             if let Some(file_name) = file_name_opt {
                                 let marks = self.samples_manager.get_marks_for_sample(&file_name);
-                                for (chop_idx, mark) in marks.iter().enumerate() {
-                                    let mx = rect.left() + mark.position * w;
-                                    let color = pad_color(chop_idx);
-                                    painter.vline(mx, rect.y_range(), egui::Stroke::new(2.0, color));
-                                    let ts = 5.0;
-                                    painter.add(egui::Shape::convex_polygon(
-                                        vec![egui::pos2(mx, rect.top()), egui::pos2(mx - ts, rect.top() + ts), egui::pos2(mx + ts, rect.top() + ts)],
-                                        color, egui::Stroke::new(1.0, color),
-                                    ));
-                                    painter.text(egui::pos2(mx, rect.top() + ts + 12.0), egui::Align2::CENTER_TOP,
-                                        format!("{}", chop_idx + 1), egui::FontId::proportional(11.0), color);
+
+                                // ── Pointer-press: start dragging nearest marker ──
+                                if ptr_pressed {
+                                    if let Some(pos) = pointer_pos {
+                                        if rect.contains(pos) {
+                                            // Find closest marker within HIT_PX
+                                            let hit = marks.iter().min_by_key(|m| {
+                                                let mx = rect.left() + m.position * w;
+                                                (pos.x - mx).abs() as i32
+                                            }).filter(|m| {
+                                                let mx = rect.left() + m.position * w;
+                                                (pos.x - mx).abs() < HIT_PX
+                                            });
+                                            if let Some(m) = hit {
+                                                *self.dragged_mark_index.write() = Some(m.id);
+                                            }
+                                        }
+                                    }
                                 }
-                                
-                                // ── Region Visual Indicators ───────────────────────────
-                                let regions = self.samples_manager.get_regions();
+
+                                // ── While dragging: update position ──────────
+                                let dragging_id = *self.dragged_mark_index.read();
+                                if ptr_down {
+                                    if let (Some(drag_id), Some(pos)) = (dragging_id, pointer_pos) {
+                                        if rect.contains(pos) || ptr_down {
+                                            let norm = ((pos.x - rect.left()) / w).clamp(0.0, 1.0);
+                                            self.samples_manager.update_mark_position_by_id(drag_id, norm);
+                                            ui.ctx().request_repaint();
+                                        }
+                                    }
+                                }
+
+                                // ── Pointer released: stop dragging ──────────
+                                if ptr_released {
+                                    *self.dragged_mark_index.write() = None;
+                                }
+
+                                // ── Hover cursor: show resize when near a marker ─
+                                if let Some(pos) = pointer_pos {
+                                    if rect.contains(pos) {
+                                        let near_any = marks.iter().any(|m| {
+                                            let mx = rect.left() + m.position * w;
+                                            (pos.x - mx).abs() < HIT_PX
+                                        });
+                                        if near_any || dragging_id.is_some() {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                                        }
+                                    }
+                                }
+
+                                // ── Draw markers ─────────────────────────────
+                                // Re-read after potential position update
+                                let marks = self.samples_manager.get_marks_for_sample(&file_name);
+                                for (chop_idx, mark) in marks.iter().enumerate() {
+                                    let mx    = rect.left() + mark.position * w;
+                                    let color = pad_color(chop_idx);
+
+                                    // Thicker line while this marker is being dragged
+                                    let is_dragging = dragging_id == Some(mark.id);
+                                    let line_w = if is_dragging { 3.0 } else { 2.0 };
+                                    let line_col = if is_dragging {
+                                        egui::Color32::WHITE
+                                    } else {
+                                        color
+                                    };
+
+                                    painter.vline(mx, rect.y_range(), egui::Stroke::new(line_w, line_col));
+
+                                    // Triangle handle at top
+                                    let ts = if is_dragging { 7.0 } else { 5.0 };
+                                    painter.add(egui::Shape::convex_polygon(
+                                        vec![
+                                            egui::pos2(mx, rect.top()),
+                                            egui::pos2(mx - ts, rect.top() + ts),
+                                            egui::pos2(mx + ts, rect.top() + ts),
+                                        ],
+                                        line_col,
+                                        egui::Stroke::new(1.0, line_col),
+                                    ));
+
+                                    // Number label
+                                    painter.text(
+                                        egui::pos2(mx, rect.top() + ts + 12.0),
+                                        egui::Align2::CENTER_TOP,
+                                        format!("{}", chop_idx + 1),
+                                        egui::FontId::proportional(11.0),
+                                        color,
+                                    );
+
+                                    // ── Hover tooltip: show time ──────────────
+                                    if let Some(pos) = pointer_pos {
+                                        if (pos.x - mx).abs() < HIT_PX && rect.contains(pos) {
+                                            let dur_secs = {
+                                                let tracks = self.drum_tracks.read();
+                                                tracks.get(*drum_idx)
+                                                    .map(|t| t.asset.frames as f32 / t.asset.sample_rate as f32)
+                                                    .unwrap_or(0.0)
+                                            };
+                                            let time_s = mark.position * dur_secs;
+                                            // Draw a small tooltip bubble above the marker
+                                            let tip_text = format!("{:.3}s", time_s);
+                                            let tip_pos  = egui::pos2(mx, rect.top() - 4.0);
+                                            let galley = painter.layout_no_wrap(
+                                                tip_text.clone(),
+                                                egui::FontId::proportional(10.0),
+                                                egui::Color32::WHITE,
+                                            );
+                                            let tip_rect = egui::Rect::from_center_size(
+                                                tip_pos,
+                                                galley.size() + egui::vec2(6.0, 4.0),
+                                            );
+                                            painter.rect_filled(tip_rect, 3.0, egui::Color32::from_rgba_unmultiplied(0,0,0,200));
+                                            painter.text(tip_pos, egui::Align2::CENTER_CENTER,
+                                                tip_text, egui::FontId::proportional(10.0), egui::Color32::WHITE);
+                                        }
+                                    }
+                                }
+
+                                // ── Region visual indicators (unchanged) ──────
+                                let regions     = self.samples_manager.get_regions();
                                 let current_mode = self.samples_manager.get_playback_mode();
                                 for region in &regions {
                                     if let (Some(from_mark), Some(to_mark)) = (
@@ -212,48 +325,52 @@ impl eframe::App for AppState {
                                         if from_mark.sample_name == file_name && to_mark.sample_name == file_name {
                                             let x1 = rect.left() + from_mark.position * w;
                                             let x2 = rect.left() + to_mark.position * w;
-                                            let is_active = matches!(current_mode, PlaybackMode::CustomRegion { region_id } if region_id == region.id);
-                                            
-                                            // Highlight region span
+                                            let is_active = matches!(current_mode,
+                                                PlaybackMode::CustomRegion { region_id } if region_id == region.id);
                                             let region_rect = egui::Rect::from_min_max(
                                                 egui::pos2(x1, rect.top()),
                                                 egui::pos2(x2, rect.bottom()),
                                             );
-                                            let fill_color = if is_active {
-                                                egui::Color32::from_rgba_unmultiplied(100, 200, 100, 40)
-                                            } else {
-                                                egui::Color32::from_rgba_unmultiplied(100, 150, 200, 25)
-                                            };
-                                            painter.rect_filled(region_rect, 0.0, fill_color);
-                                            
-                                            // Region label
+                                            painter.rect_filled(region_rect, 0.0,
+                                                if is_active {
+                                                    egui::Color32::from_rgba_unmultiplied(100,200,100,40)
+                                                } else {
+                                                    egui::Color32::from_rgba_unmultiplied(100,150,200,25)
+                                                });
                                             painter.text(
                                                 egui::pos2(x1 + 5.0, rect.top() + 10.0),
                                                 egui::Align2::LEFT_TOP,
                                                 &region.name,
                                                 egui::FontId::proportional(9.0),
-                                                if is_active { egui::Color32::from_rgb(150, 255, 150) } else { egui::Color32::from_gray(100) },
+                                                if is_active { egui::Color32::from_rgb(150,255,150) }
+                                                else { egui::Color32::from_gray(100) },
                                             );
                                         }
                                     }
                                 }
                             }
                         }
-                        
-                        // Playback cursor
+
+                        // ── Playback cursor (unchanged) ───────────────────
                         {
                             let prog = self.playback_position.load(Ordering::Relaxed);
-                            let px = rect.left() + prog * w;
+                            let px   = rect.left() + prog * w;
                             painter.vline(px, rect.y_range(), egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 80, 80)));
                             let ts = 8.0;
                             painter.add(egui::Shape::convex_polygon(
-                                vec![egui::pos2(px, rect.top() + ts), egui::pos2(px - ts, rect.top()), egui::pos2(px + ts, rect.top())],
-                                egui::Color32::from_rgb(255, 80, 80), egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
+                                vec![
+                                    egui::pos2(px, rect.top() + ts),
+                                    egui::pos2(px - ts, rect.top()),
+                                    egui::pos2(px + ts, rect.top()),
+                                ],
+                                egui::Color32::from_rgb(255, 80, 80),
+                                egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
                             ));
                         }
-                        
-                        // Seek interaction
-                        if response.dragged() || response.clicked() {
+
+                        // ── Seek: only when NOT dragging a marker ─────────
+                        let is_dragging_marker = self.dragged_mark_index.read().is_some();
+                        if !is_dragging_marker && (response.dragged() || response.clicked()) {
                             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                                 if rect.contains(pos) {
                                     let normalized = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
@@ -261,10 +378,10 @@ impl eframe::App for AppState {
                                     let sp = {
                                         let tracks = self.drum_tracks.read();
                                         if let WaveformFocus::DrumTrack(drum_idx) = &focus {
-                                            tracks.get(*drum_idx).map(|t| (normalized as f64 * t.asset.pcm.len() as f64) as u64)
-                                        } else {
-                                            None
-                                        }
+                                            tracks.get(*drum_idx).map(|t| {
+                                                (normalized as f64 * t.asset.pcm.len() as f64) as u64
+                                            })
+                                        } else { None }
                                     };
                                     if let Some(sp) = sp {
                                         self.playback_sample_index.store(sp, Ordering::Relaxed);
@@ -273,7 +390,11 @@ impl eframe::App for AppState {
                             }
                         }
                     } else {
-                        let text = if focused_asset.is_none() { "No sample loaded – click Load Sample" } else { "Analyzing waveform..." };
+                        let text = if focused_asset.is_none() {
+                            "No sample loaded – click Load Sample"
+                        } else {
+                            "Analyzing waveform..."
+                        };
                         painter.text(rect.center(), egui::Align2::CENTER_CENTER, text,
                             egui::FontId::monospace(13.0), egui::Color32::from_gray(160));
                     }

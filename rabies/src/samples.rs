@@ -55,6 +55,7 @@ impl SamplesManager {
         }
     }
     
+    
     pub fn mark_current_position(&self, sample_path: &str, sample_name: &str, position: f32) {
         let mut next_id = self.next_id.write();
         let id = *next_id;
@@ -230,4 +231,9 @@ impl SamplesManager {
     pub fn get_mark_by_id(&self, id: usize) -> Option<SampleMark> {
         self.marks.read().iter().find(|m| m.id == id).cloned()
     }
+    pub fn update_mark_position_by_id(&self, id: usize, new_position: f32) {
+    if let Some(mark) = self.marks.write().iter_mut().find(|m| m.id == id) {
+        mark.position = new_position.clamp(0.0, 1.0);
+    }
+}
 }
