@@ -1,3 +1,4 @@
+// src/adsr.rs
 use std::sync::Arc;
 
 /// ADSR Envelope phases
@@ -22,10 +23,10 @@ pub struct ADSREnvelope {
 impl Default for ADSREnvelope {
     fn default() -> Self {
         Self {
-            attack: 0.0,
-            decay: 0.0,
-            sustain: 0.0,
-            release: 0.0,
+            attack: 0.005,
+            decay: 0.1,
+            sustain: 1.0,   // full sustain so ADSR-enabled sounds play
+            release: 0.1,
         }
     }
 }
@@ -34,7 +35,6 @@ impl ADSREnvelope {
     pub fn new(attack: f32, decay: f32, sustain: f32, release: f32) -> Self {
         Self { attack, decay, sustain, release }
     }
-
     pub fn percussive() -> Self {
         Self {
             attack: 0.001,
@@ -43,7 +43,6 @@ impl ADSREnvelope {
             release: 0.05,
         }
     }
-
     pub fn pad() -> Self {
         Self {
             attack: 0.3,
@@ -52,7 +51,6 @@ impl ADSREnvelope {
             release: 0.5,
         }
     }
-
     pub fn pluck() -> Self {
         Self {
             attack: 0.001,
@@ -82,16 +80,12 @@ impl Default for EnvelopeState {
 }
 
 impl EnvelopeState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+    pub fn new() -> Self { Self::default() }
     pub fn trigger(&mut self) {
         self.phase = ADSRPhase::Attack;
         self.elapsed = 0.0;
         self.gate_open = true;
     }
-
     pub fn release(&mut self) {
         if self.phase != ADSRPhase::Done {
             self.phase = ADSRPhase::Release;
@@ -99,16 +93,10 @@ impl EnvelopeState {
             self.gate_open = false;
         }
     }
-
-    /// Calculate envelope gain for current sample
     pub fn get_gain(&mut self, adsr: &ADSREnvelope, sample_rate: f32) -> f32 {
-        if self.phase == ADSRPhase::Done {
-            return 0.0;
-        }
-
+        if self.phase == ADSRPhase::Done { return 0.0; }
         let dt = 1.0 / sample_rate as f64;
         self.elapsed += dt;
-
         match self.phase {
             ADSRPhase::Attack => {
                 if adsr.attack <= 0.0 {
@@ -158,10 +146,7 @@ impl EnvelopeState {
             ADSRPhase::Done => 0.0,
         }
     }
-
-    pub fn is_done(&self) -> bool {
-        self.phase == ADSRPhase::Done
-    }
+    pub fn is_done(&self) -> bool { self.phase == ADSRPhase::Done }
 }
 
 /// Voice with PCM data and envelope
@@ -174,8 +159,12 @@ pub struct Voice {
     pub speed: f32,
     pub adsr: ADSREnvelope,
     pub envelope: EnvelopeState,
-}
+    pub adsr_enabled: bool,
+    pub end_frame: Option<usize>,
+    }
 
+
+// src/adsr.rs - Line ~176
 impl Voice {
     pub fn new(
         pcm: Arc<Vec<f32>>,
@@ -183,6 +172,7 @@ impl Voice {
         start_frame: usize,
         speed: f32,
         adsr: ADSREnvelope,
+        adsr_enabled: bool,
     ) -> Self {
         Self {
             pcm,
@@ -192,53 +182,70 @@ impl Voice {
             speed,
             adsr,
             envelope: EnvelopeState::new(),
+            adsr_enabled,
+            end_frame: None,  // ✅ ADD THIS
         }
     }
+    // ... rest of impl
 
-    pub fn trigger(&mut self) {
-        self.envelope.trigger();
-    }
 
-    pub fn release(&mut self) {
-        self.envelope.release();
-    }
-
+    pub fn trigger(&mut self) { self.envelope.trigger(); }
+    pub fn release(&mut self) { self.envelope.release(); }
+    
     /// Render one sample frame, returns gain-adjusted sample
     pub fn render(&mut self, sample_rate: f32, out_channels: usize) -> Option<Vec<f32>> {
-        if self.envelope.is_done() {
-            return None;
-        }
-
-        let pcm_frames = self.pcm.len() / self.channels.max(1);
-        let i0 = self.frame_pos as usize;
-
-        if i0 >= pcm_frames.saturating_sub(1) {
-            if self.envelope.gate_open {
-                self.envelope.release();
-            }
-            if self.envelope.is_done() {
+            if self.adsr_enabled && self.envelope.is_done() {
                 return None;
             }
+            
+            let pcm_frames = self.pcm.len() / self.channels.max(1);
+            let effective_end = self.end_frame.unwrap_or(pcm_frames).min(pcm_frames);
+            let i0 = self.frame_pos as usize;
+            // AFTER (fixed)
+            if i0 >= effective_end.saturating_sub(1) {
+                if self.adsr_enabled {
+                    if self.envelope.gate_open {
+                        self.envelope.release();
+                    }
+                    if self.envelope.is_done() {
+                        return None;
+                    }
+                } else {
+                    // ADSR disabled: stop as soon as PCM data ends
+                    return None;
+                }
+            }
+            
+            let i1 = (i0 + 1).min(pcm_frames - 1);
+            let t = (self.frame_pos - i0 as f64) as f32;
+            
+            // ✅ KEY FIX: Gain is 1.0 when ADSR disabled, envelope when enabled
+            let gain = if self.adsr_enabled {
+                self.envelope.get_gain(&self.adsr, sample_rate)
+            } else {
+                1.0  // Full volume, no envelope shaping
+            };
+            
+            let mut samples = Vec::with_capacity(out_channels);
+            for oc in 0..out_channels {
+                let sc = oc.min(self.channels - 1);
+                let s0 = self.pcm.get(i0 * self.channels + sc).copied().unwrap_or(0.0);
+                let s1 = self.pcm.get(i1 * self.channels + sc).copied().unwrap_or(0.0);
+                let smp = (s0 + t * (s1 - s0)) * gain;
+                samples.push(smp);
+            }
+            
+            self.frame_pos += self.speed as f64;
+            Some(samples)  // ✅ Always return samples when not finished
         }
-
-        let i1 = (i0 + 1).min(pcm_frames - 1);
-        let t = (self.frame_pos - i0 as f64) as f32;
-        let gain = self.envelope.get_gain(&self.adsr, sample_rate);
-
-        let mut samples = Vec::with_capacity(out_channels);
-        for oc in 0..out_channels {
-            let sc = oc.min(self.channels - 1);
-            let s0 = self.pcm.get(i0 * self.channels + sc).copied().unwrap_or(0.0);
-            let s1 = self.pcm.get(i1 * self.channels + sc).copied().unwrap_or(0.0);
-            let smp = (s0 + t * (s1 - s0)) * gain;
-            samples.push(smp);
-        }
-
-        self.frame_pos += self.speed as f64;
-        Some(samples)
-    }
-
     pub fn is_finished(&self) -> bool {
-        self.envelope.is_done()
+        if self.adsr_enabled {
+            self.envelope.is_done()
+        } else {
+            // When ADSR disabled, finished when PCM ends
+            let pcm_frames = self.pcm.len() / self.channels.max(1);
+            let effective_end = self.end_frame.unwrap_or(pcm_frames).min(pcm_frames);
+            self.frame_pos >= effective_end as f64
+        }
     }
 }

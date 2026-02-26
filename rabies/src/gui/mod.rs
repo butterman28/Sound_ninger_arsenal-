@@ -10,17 +10,30 @@ use crate::audio::{AudioAsset, AudioManager, WaveformAnalysis};
 use crate::samples::{SamplesManager, PlaybackMode};
 use crate::adsr::{ADSREnvelope, Voice};
 
+
 pub const NUM_STEPS: usize = 16;
 
-/// One independently-loaded sample as a sequencer row.
+
+// In DrumTrack::new(), ADD after chop_adsr_enabled: Vec::new():
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChopPlayMode {
+    ToEnd,       // play until sample end
+    ToNextChop,  // play until next marker
+    ToNextStep,  // play for exactly one sequencer step duration
+}
+
 pub struct DrumTrack {
     pub asset: Arc<AudioAsset>,
     pub waveform: Option<WaveformAnalysis>,
     pub steps: [bool; NUM_STEPS],
     pub chop_steps: Vec<[bool; NUM_STEPS]>,
     pub chop_adsr: Vec<ADSREnvelope>,
+    pub chop_adsr_enabled: Vec<bool>,  
+    pub chop_play_modes: Vec<ChopPlayMode>,
     pub muted: bool,
     pub adsr: ADSREnvelope,
+    pub adsr_enabled: bool,            //Per-track ADSR toggle
 }
 
 impl DrumTrack {
@@ -31,17 +44,26 @@ impl DrumTrack {
             steps: [false; NUM_STEPS],
             chop_steps: Vec::new(),
             chop_adsr: Vec::new(),
+            chop_adsr_enabled: Vec::new(),
+            chop_play_modes: Vec::new(),   // ← ADD THIS
             muted: false,
             adsr: ADSREnvelope::default(),
+            adsr_enabled: false,
         }
     }
-    
     pub fn ensure_chop_steps(&mut self, needed: usize) {
         while self.chop_steps.len() < needed {
             self.chop_steps.push([false; NUM_STEPS]);
         }
         while self.chop_adsr.len() < needed {
             self.chop_adsr.push(self.adsr);
+        }
+        while self.chop_adsr_enabled.len() < needed {
+            self.chop_adsr_enabled.push(false);  // ✅ NEW
+        }
+        while self.chop_play_modes.len() < needed {
+            self.chop_play_modes.push(ChopPlayMode::ToNextChop);
+
         }
     }
 }
@@ -128,9 +150,21 @@ impl AppState {
         let stop_target = match self.samples_manager.get_playback_mode() {
             PlaybackMode::PlayToEnd => -1.0,
             PlaybackMode::PlayToNextMarker => self.samples_manager.get_playback_target(start_pos, &asset.file_name).unwrap_or(-1.0),
+            // In start_playback(), update the CustomRegion handling:
             PlaybackMode::CustomRegion { region_id } => {
                 if let Some(region) = self.samples_manager.get_region_by_id(region_id) {
-                    self.samples_manager.get_mark_by_id(region.to).map(|m| m.position).unwrap_or(-1.0)
+                    // Set start position to region's FROM marker
+                    if let Some(from_mark) = self.samples_manager.get_mark_by_id(region.from) {
+                        if from_mark.sample_name == asset.file_name {
+                            self.playback_position.store(from_mark.position, Ordering::Relaxed);
+                            let sp = (from_mark.position as f64 * asset.pcm.len() as f64) as u64;
+                            self.playback_sample_index.store(sp, Ordering::Relaxed);
+                        }
+                    }
+                    // Stop target is still the TO marker
+                    self.samples_manager.get_mark_by_id(region.to)
+                        .map(|m| m.position)
+                        .unwrap_or(-1.0)
                 } else { -1.0 }
             }
         };
@@ -316,12 +350,12 @@ impl AppState {
     
     let mut voices: Vec<Voice> = Vec::new();
     
-    // main sample chops
+    // ── Main sample chops ─────────────────────────────────────────
     if let Some(asset) = self.current_asset.read().clone() {
         let active_pads = self.seq_grid.read()[step].clone();
         if !active_pads.is_empty() {
             let marks = self.samples_manager.get_marks();
-            let channels = asset.channels as usize;
+            let channels = asset.channels as usize;  // ✅ In scope for this block
             let total_frames = asset.pcm.len() / channels.max(1);
             let pcm = Arc::new(asset.pcm.clone());
             let chop_adsr = self.chop_adsr.read();
@@ -330,13 +364,20 @@ impl AppState {
                     if mark.sample_name != asset.file_name { continue; }
                     let start_frame = (mark.position as f64 * total_frames as f64) as usize;
                     let adsr = chop_adsr.get(pad_idx).copied().unwrap_or_default();
-                    voices.push(Voice::new(pcm.clone(), channels, start_frame, 1.0, adsr));
+                    voices.push(Voice::new(
+                        pcm.clone(),
+                        channels,
+                        start_frame,
+                        1.0,
+                        adsr,
+                        false,  // main sample chops: ADSR disabled
+                    ));
                 }
             }
         }
     }
     
-    // Drum track chops
+    // ── Drum track chops ──────────────────────────────────────────
     {
         let tracks = self.drum_tracks.read();
         let main_idx = *self.main_track_index.read();
@@ -344,7 +385,7 @@ impl AppState {
             if track.muted { continue; }
             let chop_marks = self.samples_manager.get_marks_for_sample(&track.asset.file_name);
             if !chop_marks.is_empty() {
-                let channels = track.asset.channels as usize;
+                let channels = track.asset.channels as usize;  // ✅ In scope for this block
                 let total_frames = track.asset.pcm.len() / channels.max(1);
                 let pcm = Arc::new(track.asset.pcm.clone());
                 for (chop_idx, mark) in chop_marks.iter().enumerate() {
@@ -356,17 +397,56 @@ impl AppState {
                     if fires {
                         let start_frame = (mark.position as f64 * total_frames as f64) as usize;
                         let adsr = track.chop_adsr.get(chop_idx).copied().unwrap_or(track.adsr);
-                        voices.push(Voice::new(pcm.clone(), channels, start_frame, 1.0, adsr));
+                        let chop_adsr_on = track.chop_adsr_enabled
+                            .get(chop_idx)
+                            .copied()
+                            .unwrap_or(track.adsr_enabled);
+                        let play_mode = track.chop_play_modes
+                            .get(chop_idx)
+                            .copied()
+                            .unwrap_or(ChopPlayMode::ToEnd);
+                        let end_frame = match play_mode {
+                            ChopPlayMode::ToEnd => None,
+                            ChopPlayMode::ToNextChop => {
+                                chop_marks.get(chop_idx + 1)
+                                    .map(|next| (next.position as f64 * total_frames as f64) as usize)
+                            }
+                            // AFTER
+                            ChopPlayMode::ToNextStep => {
+                                // end_frame is a PCM index, so use the asset's own sample rate
+                                let asset_sr = track.asset.sample_rate as f64;
+                                let step_frames = (60.0 / bpm as f64 / 4.0 * asset_sr) as usize;
+                                Some(start_frame + step_frames)
+                            }
+                        };
+                        let mut voice = Voice::new(
+                            pcm.clone(),
+                            channels,
+                            start_frame,
+                            1.0,
+                            adsr,
+                            chop_adsr_on,
+                        );
+                        voice.end_frame = end_frame;
+                        voices.push(voice);
                     }
                 }
             } else if track.steps[step] {
-                let channels = track.asset.channels as usize;
-                voices.push(Voice::new(Arc::new(track.asset.pcm.clone()), channels, 0, 1.0, track.adsr));
+                // Whole-sample trigger
+                let channels = track.asset.channels as usize;  // ✅ In scope for this block
+                voices.push(Voice::new(
+                    Arc::new(track.asset.pcm.clone()), 
+                    channels, 
+                    0, 
+                    1.0, 
+                    track.adsr,
+                    track.adsr_enabled,  // ✅ Use track's ADSR enabled flag
+                ));
             }
         }
     }
     
-    // ✅ Add voices to active list (audio callback only renders, doesn't create)
+    // ✅ Add voices to active list
     if !voices.is_empty() {
         self.ensure_seq_stream();
         if let Ok(mut active) = self.active_voices.lock() {
@@ -374,7 +454,6 @@ impl AppState {
         }
     }
 }
-
     fn ensure_seq_stream(&self) {
     if self.seq_stream_handle.read().is_some() { return; }
     let host = cpal::default_host();
@@ -394,7 +473,7 @@ impl AppState {
     
     let out_channels = cfg.channels as usize;
     let sample_rate = cfg.sample_rate.0 as f32;
-    let seq_playing = self.seq_playing.clone();
+    let _seq_playing = self.seq_playing.clone();
     
     let stream = device.build_output_stream(
         &cfg,
