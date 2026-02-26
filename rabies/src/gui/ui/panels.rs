@@ -320,25 +320,29 @@ impl AppState {
                             drop(tracks);
 
                             // ✅ Per-chop Play Mode Toggle Buttons (ADD THIS)
-                            let play_mode = {
+                                                        let play_mode = {
                                 let tracks = self.drum_tracks.read();
                                 tracks.get(drum_idx)
                                     .and_then(|t| t.chop_play_modes.get(chop_idx).copied())
-                                   .unwrap_or(crate::gui::ChopPlayMode::ToNextChop)
-
+                                    .unwrap_or(crate::gui::ChopPlayMode::ToNextChop)
                             };
-                            let modes = [
+
+                            // First 3 fixed modes
+                            let fixed_modes = [
                                 (crate::gui::ChopPlayMode::ToEnd,      "▶∞",  "Play to end of sample"),
                                 (crate::gui::ChopPlayMode::ToNextChop, "▶|",  "Play to next chop marker"),
                                 (crate::gui::ChopPlayMode::ToNextStep, "▶□",  "Play for one step then stop"),
                             ];
-                            for (mode, label, tip) in modes {
+                            for (mode, label, tip) in fixed_modes {
                                 let active = play_mode == mode;
                                 let col = if active { chop_color } else { egui::Color32::from_gray(80) };
                                 let btn = egui::Button::new(egui::RichText::new(label).small().color(col))
-                                    .fill(if active { egui::Color32::from_rgba_unmultiplied(
-                                        chop_color.r(), chop_color.g(), chop_color.b(), 35)
-                                    } else { egui::Color32::TRANSPARENT });
+                                    .fill(if active {
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            chop_color.r(), chop_color.g(), chop_color.b(), 35)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    });
                                 if ui.add(btn).on_hover_text(tip).clicked() && !active {
                                     let mut tracks = self.drum_tracks.write();
                                     if let Some(t) = tracks.get_mut(drum_idx) {
@@ -348,6 +352,97 @@ impl AppState {
                                     }
                                 }
                             }
+
+                            // ── 4th mode: ToMarker — button + inline marker picker ──
+                            {
+                                // Collect all markers for this track (excluding the chop's own start)
+                                let all_marks = self.samples_manager.get_marks_for_sample(&file_name);
+
+                                let is_to_marker = matches!(play_mode, crate::gui::ChopPlayMode::ToMarker(_));
+                                let current_target_id: Option<usize> = if let crate::gui::ChopPlayMode::ToMarker(id) = play_mode {
+                                    Some(id)
+                                } else {
+                                    None
+                                };
+
+                                // The ▶M toggle button
+                                let col = if is_to_marker { chop_color } else { egui::Color32::from_gray(80) };
+                                let btn = egui::Button::new(egui::RichText::new("▶M").small().color(col))
+                                    .fill(if is_to_marker {
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            chop_color.r(), chop_color.g(), chop_color.b(), 35)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    });
+                                if ui.add(btn)
+                                    .on_hover_text("Play to a specific marker you choose")
+                                    .clicked()
+                                    && !is_to_marker
+                                {
+                                    // Activate with first available marker (that isn't this chop)
+                                    let own_pos = all_marks.get(chop_idx).map(|m| m.position).unwrap_or(0.0);
+                                    let first_other = all_marks.iter()
+                                        .find(|m| m.position > own_pos)
+                                        .map(|m| m.id)
+                                        .or_else(|| all_marks.first().map(|m| m.id));
+                                    if let Some(target_id) = first_other {
+                                        let mut tracks = self.drum_tracks.write();
+                                        if let Some(t) = tracks.get_mut(drum_idx) {
+                                            if let Some(m) = t.chop_play_modes.get_mut(chop_idx) {
+                                                *m = crate::gui::ChopPlayMode::ToMarker(target_id);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Inline marker ComboBox — only shown when ▶M is active
+                                if is_to_marker && !all_marks.is_empty() {
+                                    let dur_secs = {
+                                        let tracks = self.drum_tracks.read();
+                                        tracks.get(drum_idx)
+                                            .map(|t| t.asset.frames as f32 / t.asset.sample_rate as f32)
+                                            .unwrap_or(0.0)
+                                    };
+
+                                    // Label for currently selected target
+                                    let selected_label = current_target_id
+                                        .and_then(|id| all_marks.iter().find(|m| m.id == id))
+                                        .map(|m| format!("M{} {:.2}s", m.id, m.position * dur_secs))
+                                        .unwrap_or_else(|| "Pick marker".to_string());
+
+                                    let combo_id = egui::Id::new("to_marker_combo")
+                                        .with(drum_idx)
+                                        .with(chop_idx);
+
+                                    egui::ComboBox::from_id_source(combo_id)
+                                        .selected_text(
+                                            egui::RichText::new(&selected_label)
+                                                .small()
+                                                .color(chop_color)
+                                        )
+                                        .width(90.0)
+                                        .show_ui(ui, |ui| {
+                                            for mark in &all_marks {
+                                                let label = format!(
+                                                    "M{} @ {:.2}s",
+                                                    mark.id,
+                                                    mark.position * dur_secs
+                                                );
+                                                let is_selected = current_target_id == Some(mark.id);
+                                                if ui.selectable_label(is_selected, &label).clicked() {
+                                                    let mut tracks = self.drum_tracks.write();
+                                                    if let Some(t) = tracks.get_mut(drum_idx) {
+                                                        if let Some(m) = t.chop_play_modes.get_mut(chop_idx) {
+                                                            *m = crate::gui::ChopPlayMode::ToMarker(mark.id);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                }
+                            }
+                            // ── end play mode buttons ─────────────────────────
+
                             
                             let (knob_rect, _) = ui.allocate_exact_size(egui::vec2(steps_total, knob_h), egui::Sense::hover());
                             ui.painter().rect_filled(knob_rect, 2.0, egui::Color32::from_rgb(16, 16, 24));

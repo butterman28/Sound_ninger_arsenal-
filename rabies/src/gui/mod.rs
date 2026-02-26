@@ -21,6 +21,7 @@ pub enum ChopPlayMode {
     ToEnd,       // play until sample end
     ToNextChop,  // play until next marker
     ToNextStep,  // play for exactly one sequencer step duration
+    ToMarker(usize),    // play until a specific marker ID (user-chosen)
 }
 
 pub struct DrumTrack {
@@ -404,19 +405,23 @@ impl AppState {
                         let play_mode = track.chop_play_modes
                             .get(chop_idx)
                             .copied()
-                            .unwrap_or(ChopPlayMode::ToEnd);
+                            .unwrap_or(ChopPlayMode::ToNextChop);
                         let end_frame = match play_mode {
                             ChopPlayMode::ToEnd => None,
                             ChopPlayMode::ToNextChop => {
                                 chop_marks.get(chop_idx + 1)
                                     .map(|next| (next.position as f64 * total_frames as f64) as usize)
                             }
-                            // AFTER
                             ChopPlayMode::ToNextStep => {
-                                // end_frame is a PCM index, so use the asset's own sample rate
                                 let asset_sr = track.asset.sample_rate as f64;
                                 let step_frames = (60.0 / bpm as f64 / 4.0 * asset_sr) as usize;
                                 Some(start_frame + step_frames)
+                            }
+                            ChopPlayMode::ToMarker(target_id) => {
+                                // Look up the chosen marker by ID in THIS track's marks
+                                chop_marks.iter()
+                                    .find(|m| m.id == target_id)
+                                    .map(|m| (m.position as f64 * total_frames as f64) as usize)
                             }
                         };
                         let mut voice = Voice::new(
