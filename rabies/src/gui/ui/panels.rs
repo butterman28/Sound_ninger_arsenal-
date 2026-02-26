@@ -245,6 +245,7 @@ impl AppState {
                         let time_at = mark.position * dur_asset;
                         
                         // Chop row with step buttons
+
                         ui.horizontal(|ui| {
                             let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
                             ui.painter().rect_filled(lr, 3.0, egui::Color32::from_rgb(17, 17, 25));
@@ -253,15 +254,52 @@ impl AppState {
                                 egui::Rect::from_min_size(lr.min+egui::vec2(14.0,8.0), egui::vec2(3.0, row_h-16.0)),
                                 1.0, chop_color,
                             );
+                            // Show 🎹 indicator if this chop has piano notes
+                            let has_piano_notes = {
+                                let tracks = self.drum_tracks.read();
+                                tracks.get(drum_idx)
+                                    .and_then(|t| t.chop_piano_notes.get(chop_idx))
+                                    .map(|n| !n.is_empty())
+                                    .unwrap_or(false)
+                            };
                             ui.painter().text(egui::pos2(lr.min.x+22.0, lr.center().y-4.0), egui::Align2::LEFT_CENTER,
-                                format!("Chop {}", chop_idx + 1), egui::FontId::proportional(10.0), chop_color);
+                                format!("Chop {}{}", chop_idx + 1, if has_piano_notes { " 🎹" } else { "" }),
+                                egui::FontId::proportional(10.0), chop_color);
                             ui.painter().text(egui::pos2(lr.min.x+22.0, lr.center().y+5.0), egui::Align2::LEFT_CENTER,
                                 format!("{:.2}s", time_at), egui::FontId::proportional(8.0), egui::Color32::from_gray(85));
                             if lresp.clicked() {
                                 *self.waveform_focus.write() = WaveformFocus::DrumTrack(drum_idx);
                             }
+                            // ── Right-click: open piano roll ──────────────────────────
+                            let pr_ref = self.piano_roll_chop.clone();
+                            lresp.context_menu(|ui| {
+                                ui.set_min_width(175.0);
+                                ui.label(
+                                    egui::RichText::new(format!("Chop {}  @{:.2}s", chop_idx + 1, time_at))
+                                        .small().color(chop_color),
+                                );
+                                ui.separator();
+                                if ui.button("🎹  Piano Roll").clicked() {
+                                    *pr_ref.write() = Some((drum_idx, chop_idx));
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if ui.button(egui::RichText::new("🗑  Clear Steps").color(egui::Color32::from_rgb(200,80,80))).clicked() {
+                                    let mut tracks = self.drum_tracks.write();
+                                    if let Some(t) = tracks.get_mut(drum_idx) {
+                                        if let Some(row) = t.chop_steps.get_mut(chop_idx) {
+                                            *row = [false; NUM_STEPS];
+                                        }
+                                        if let Some(notes) = t.chop_piano_notes.get_mut(chop_idx) {
+                                            notes.clear();
+                                        }
+                                    }
+                                    ui.close_menu();
+                                }
+                            });
+                            // ──────────────────────────────────────────────────────────
                             ui.add_space(8.0);
-                            
+                                                    
                             // Use seq_grid for main track, chop_steps for others
                             let is_ons: [bool; NUM_STEPS] = {
                                 let tracks = self.drum_tracks.read();

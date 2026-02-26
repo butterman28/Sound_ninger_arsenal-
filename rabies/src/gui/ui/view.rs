@@ -10,6 +10,7 @@ impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_sequencer();
         self.draw_piano_roll(ctx);
+        self.draw_chop_piano_roll(ctx);  // ← ADD THIS LINE
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Audio Sampler");
