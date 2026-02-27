@@ -18,6 +18,7 @@ pub struct AudioAsset {
     pub channels: u16,
     pub frames: u64,
     pub file_name: String,
+    pub sample_uuid: uuid::Uuid,  // ✅ Every loaded asset carries its own UUID
 }
 
 #[derive(Debug, Clone)]
@@ -38,20 +39,18 @@ impl AudioManager {
     }
 
     pub fn load_audio(&self, path: &str) -> Result<Arc<AudioAsset>, Box<dyn std::error::Error>> {
-        // Check cache first
-        {
-            let assets = self.assets.read();
-            if let Some(cached) = assets.get(path) {
-                println!("Loaded from cache: {}", path);
-                return Ok(cached.clone());
-            }
-        }
+        // NOTE: We intentionally do NOT return cached assets here.
+        // Returning a cached asset would mean two tracks loaded from the
+        // same file share a UUID → they'd share chop markers. Instead we
+        // always decode fresh and assign a brand-new UUID so every load is
+        // treated as a clean slate ("tabula rasa").
+        //
+        // If you later want to re-enable caching for large files, generate a
+        // new UUID after cache hit and return a cloned asset with that new UUID.
 
-        // Open file
         let file = File::open(path)?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
-        // Probe format
         let mut hint = Hint::new();
         if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
             hint.with_extension(ext);
@@ -65,8 +64,7 @@ impl AudioManager {
         )?;
 
         let mut format = probed.format;
-        
-        // Extract track ID BEFORE entering loop to avoid borrow checker issues
+
         let track = format
             .tracks()
             .iter()
@@ -86,26 +84,19 @@ impl AudioManager {
         let mut pcm: Vec<f32> = Vec::new();
         let mut frames: u64 = 0;
 
-        // Decode packets
         loop {
             let packet = match format.next_packet() {
                 Ok(p) => p,
                 Err(_) => break,
             };
-
-            if packet.track_id() != track_id {
-                continue;
-            }
-
+            if packet.track_id() != track_id { continue; }
             match decoder.decode(&packet) {
                 Ok(decoded) => {
                     match decoded {
                         AudioBufferRef::F32(buf) => {
                             let channels = buf.spec().channels.count();
                             for frame in 0..buf.frames() {
-                                for ch in 0..channels {
-                                    pcm.push(buf.chan(ch)[frame]);
-                                }
+                                for ch in 0..channels { pcm.push(buf.chan(ch)[frame]); }
                             }
                             frames += buf.frames() as u64;
                         }
@@ -113,8 +104,7 @@ impl AudioManager {
                             let channels = buf.spec().channels.count();
                             for frame in 0..buf.frames() {
                                 for ch in 0..channels {
-                                    let sample = buf.chan(ch)[frame] as f32 / 127.5 - 1.0;
-                                    pcm.push(sample);
+                                    pcm.push(buf.chan(ch)[frame] as f32 / 127.5 - 1.0);
                                 }
                             }
                             frames += buf.frames() as u64;
@@ -123,8 +113,7 @@ impl AudioManager {
                             let channels = buf.spec().channels.count();
                             for frame in 0..buf.frames() {
                                 for ch in 0..channels {
-                                    let sample = buf.chan(ch)[frame] as f32 / 127.0;
-                                    pcm.push(sample);
+                                    pcm.push(buf.chan(ch)[frame] as f32 / 127.0);
                                 }
                             }
                             frames += buf.frames() as u64;
@@ -133,8 +122,7 @@ impl AudioManager {
                             let channels = buf.spec().channels.count();
                             for frame in 0..buf.frames() {
                                 for ch in 0..channels {
-                                    let sample = buf.chan(ch)[frame] as f32 / 32767.5 - 1.0;
-                                    pcm.push(sample);
+                                    pcm.push(buf.chan(ch)[frame] as f32 / 32767.5 - 1.0);
                                 }
                             }
                             frames += buf.frames() as u64;
@@ -143,8 +131,7 @@ impl AudioManager {
                             let channels = buf.spec().channels.count();
                             for frame in 0..buf.frames() {
                                 for ch in 0..channels {
-                                    let sample = buf.chan(ch)[frame] as f32 / 32767.0;
-                                    pcm.push(sample);
+                                    pcm.push(buf.chan(ch)[frame] as f32 / 32767.0);
                                 }
                             }
                             frames += buf.frames() as u64;
@@ -154,9 +141,7 @@ impl AudioManager {
                             for frame in 0..buf.frames() {
                                 for ch in 0..channels {
                                     let val = buf.chan(ch)[frame];
-                                    // Use .inner() instead of deprecated .into_u32()
-                                    let sample = (val.inner() as f32) / 8388607.5 - 1.0;
-                                    pcm.push(sample);
+                                    pcm.push((val.inner() as f32) / 8388607.5 - 1.0);
                                 }
                             }
                             frames += buf.frames() as u64;
@@ -166,9 +151,7 @@ impl AudioManager {
                             for frame in 0..buf.frames() {
                                 for ch in 0..channels {
                                     let val = buf.chan(ch)[frame];
-                                    // Use .inner() instead of deprecated .into_i32()
-                                    let sample = (val.inner() as f32) / 8388607.0;
-                                    pcm.push(sample);
+                                    pcm.push((val.inner() as f32) / 8388607.0);
                                 }
                             }
                             frames += buf.frames() as u64;
@@ -177,8 +160,7 @@ impl AudioManager {
                             let channels = buf.spec().channels.count();
                             for frame in 0..buf.frames() {
                                 for ch in 0..channels {
-                                    let sample = buf.chan(ch)[frame] as f32 / 2147483647.5 - 1.0;
-                                    pcm.push(sample);
+                                    pcm.push(buf.chan(ch)[frame] as f32 / 2147483647.5 - 1.0);
                                 }
                             }
                             frames += buf.frames() as u64;
@@ -187,8 +169,7 @@ impl AudioManager {
                             let channels = buf.spec().channels.count();
                             for frame in 0..buf.frames() {
                                 for ch in 0..channels {
-                                    let sample = buf.chan(ch)[frame] as f32 / 2147483647.0;
-                                    pcm.push(sample);
+                                    pcm.push(buf.chan(ch)[frame] as f32 / 2147483647.0);
                                 }
                             }
                             frames += buf.frames() as u64;
@@ -197,8 +178,7 @@ impl AudioManager {
                             let channels = buf.spec().channels.count();
                             for frame in 0..buf.frames() {
                                 for ch in 0..channels {
-                                    let sample = buf.chan(ch)[frame] as f32;
-                                    pcm.push(sample);
+                                    pcm.push(buf.chan(ch)[frame] as f32);
                                 }
                             }
                             frames += buf.frames() as u64;
@@ -213,6 +193,8 @@ impl AudioManager {
             return Err("no audio samples decoded".into());
         }
 
+        // ✅ Fresh UUID every time — even for the same file path.
+        // This is the guarantee that reloading a file is a clean slate.
         let asset = Arc::new(AudioAsset {
             pcm,
             sample_rate,
@@ -223,15 +205,10 @@ impl AudioManager {
                 .and_then(|f| f.to_str())
                 .unwrap_or("unknown")
                 .to_string(),
+            sample_uuid: uuid::Uuid::new_v4(),
         });
 
-        // Cache the asset
-        {
-            let mut assets = self.assets.write();
-            assets.insert(path.to_string(), asset.clone());
-        }
-
-        println!("Loaded and cached: {}", path);
+        println!("Loaded: {} (uuid={})", path, asset.sample_uuid);
         Ok(asset)
     }
 
@@ -251,11 +228,9 @@ impl AudioManager {
                 let start = i * bucket_size;
                 let end = (start + bucket_size).min(samples.len());
                 let slice = &samples[start..end];
-
                 let (min, max) = slice.iter().fold((0.0f32, 0.0f32), |(min, max), &s| {
                     (min.min(s), max.max(s))
                 });
-
                 (min, max)
             })
             .collect();

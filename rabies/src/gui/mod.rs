@@ -6,10 +6,11 @@ use parking_lot::RwLock;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SizedSample, FromSample};
 use atomic_float::AtomicF32;
+use uuid::Uuid;
 use crate::audio::{AudioAsset, AudioManager, WaveformAnalysis};
 use crate::samples::{SamplesManager, PlaybackMode};
 use crate::adsr::{ADSREnvelope, Voice};
-use crate::piano_roll::PianoRollNote; 
+use crate::piano_roll::PianoRollNote;
 use crate::recording::{RecordingManager, RecordingTrack, RecordState};
 
 pub const NUM_STEPS: usize = 16;
@@ -25,6 +26,9 @@ pub enum ChopPlayMode {
 pub struct DrumTrack {
     pub asset: Arc<AudioAsset>,
     pub waveform: Option<WaveformAnalysis>,
+    /// ✅ Fresh UUID assigned at construction time — independent of filename.
+    /// Reloading the same file produces a new UUID and thus an empty mark list.
+    pub sample_uuid: Uuid,
     pub steps: [bool; NUM_STEPS],
     pub chop_steps: Vec<[bool; NUM_STEPS]>,
     pub chop_adsr: Vec<ADSREnvelope>,
@@ -41,12 +45,15 @@ impl DrumTrack {
         Self {
             asset,
             waveform,
+            // ✅ Always fresh — every load instance gets its own UUID.
+            // This is what makes same-filename reloads start with zero chops.
+            sample_uuid: Uuid::new_v4(),
             steps: [false; NUM_STEPS],
             chop_steps: Vec::new(),
             chop_adsr: Vec::new(),
             chop_adsr_enabled: Vec::new(),
             chop_play_modes: Vec::new(),
-            chop_piano_notes: Vec::new(),  // ← NEW
+            chop_piano_notes: Vec::new(),
             muted: false,
             adsr: ADSREnvelope::default(),
             adsr_enabled: false,
@@ -66,7 +73,7 @@ impl DrumTrack {
         while self.chop_play_modes.len() < needed {
             self.chop_play_modes.push(ChopPlayMode::ToNextChop);
         }
-        while self.chop_piano_notes.len() < needed {  // ← NEW
+        while self.chop_piano_notes.len() < needed {
             self.chop_piano_notes.push(Vec::new());
         }
     }
@@ -107,15 +114,12 @@ pub struct AppState {
     pub(crate) seq_voice_queue: Arc<std::sync::Mutex<Vec<Voice>>>,
     pub waveform_focus: Arc<RwLock<WaveformFocus>>,
     pub piano_roll_open: Arc<RwLock<bool>>,
-    pub piano_roll_chop: Arc<RwLock<Option<(usize, usize)>>>,  // ← NEW: (track_idx, chop_idx)
+    pub piano_roll_chop: Arc<RwLock<Option<(usize, usize)>>>,
     pub main_track_index: Arc<RwLock<Option<usize>>>,
-    pub rec_manager:        Arc<RecordingManager>,
-    pub rec_tracks:         Arc<RwLock<Vec<RecordingTrack>>>,
-    /// Which rec_track index is currently recording (if any)
-    pub rec_active_track:   Arc<RwLock<Option<usize>>>,
-    /// Cached list of input devices (refreshed on demand)
-    pub input_devices:      Arc<RwLock<Vec<crate::recording::InputDevice>>>,
-
+    pub rec_manager:      Arc<RecordingManager>,
+    pub rec_tracks:       Arc<RwLock<Vec<RecordingTrack>>>,
+    pub rec_active_track: Arc<RwLock<Option<usize>>>,
+    pub input_devices:    Arc<RwLock<Vec<crate::recording::InputDevice>>>,
 }
 
 impl Default for AppState {
@@ -166,7 +170,7 @@ impl AppState {
         let start_pos = self.playback_position.load(Ordering::Relaxed);
         let stop_target = match self.samples_manager.get_playback_mode() {
             PlaybackMode::PlayToEnd => -1.0,
-            PlaybackMode::PlayToNextMarker => self.samples_manager.get_playback_target(start_pos, &asset.file_name).unwrap_or(-1.0),
+            PlaybackMode::PlayToNextMarker => self.samples_manager.get_playback_target(start_pos, &asset.sample_uuid).unwrap_or(-1.0),
             PlaybackMode::CustomRegion { region_id } => {
                 if let Some(region) = self.samples_manager.get_region_by_id(region_id) {
                     if let Some(from_mark) = self.samples_manager.get_mark_by_id(region.from) {
@@ -276,7 +280,7 @@ impl AppState {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Audio", &["mp3","wav","flac","ogg","m4a","aac"])
             .pick_file()
-        {   
+        {
             let audio_manager    = self.audio_manager.clone();
             let drum_tracks      = self.drum_tracks.clone();
             let drum_loading     = self.drum_loading.clone();
@@ -292,6 +296,7 @@ impl AppState {
                 }));
                 match result {
                     Ok(Ok(asset)) => {
+                        // DrumTrack::new assigns its own fresh UUID — no register_sample needed.
                         let waveform  = audio_manager.analyze_waveform(&asset, 400);
                         let track     = DrumTrack::new(asset.clone(), Some(waveform.clone()));
                         let track_idx = {
@@ -321,6 +326,7 @@ impl AppState {
             let drum_tracks   = self.drum_tracks.clone();
             let drum_loading  = self.drum_loading.clone();
             let status        = self.status.clone();
+
             drum_loading.store(true, Ordering::Relaxed);
             std::thread::spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -328,6 +334,7 @@ impl AppState {
                 }));
                 match result {
                     Ok(Ok(asset)) => {
+                        // DrumTrack::new assigns its own fresh UUID — no register_sample needed.
                         let waveform = audio_manager.analyze_waveform(&asset, 400);
                         let track    = DrumTrack::new(asset.clone(), Some(waveform));
                         drum_tracks.write().push(track);
@@ -350,12 +357,10 @@ impl AppState {
         }
     }
 
-     /// Refresh the cached list of input devices (spawns no thread; call from UI).
     pub fn refresh_input_devices(&self) {
         *self.input_devices.write() = RecordingManager::list_input_devices();
     }
 
-    /// Add a new, empty recording track row.
     pub fn add_rec_track(&self) {
         if self.input_devices.read().is_empty() {
             self.refresh_input_devices();
@@ -363,9 +368,7 @@ impl AppState {
         self.rec_tracks.write().push(RecordingTrack::new());
     }
 
-    /// Begin capturing from the device selected for `track_idx`.
     pub fn start_recording(&self, track_idx: usize) {
-        // Only one recording at a time
         if self.rec_manager.is_recording() {
             *self.status.write() = "Already recording — stop current recording first".to_string();
             return;
@@ -406,7 +409,6 @@ impl AppState {
         }
     }
 
-    /// Stop capturing and store the PCM in the track's asset.
     pub fn stop_recording(&self, track_idx: usize) {
         self.rec_manager.stop();
         *self.rec_active_track.write() = None;
@@ -420,12 +422,6 @@ impl AppState {
             )
         };
 
-        // Sanitise device label into a filename-safe string
-        let safe: String = dev_label
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-            .take(20)
-            .collect();
         let file_name = format!("rec{}_take{}.wav", track_idx + 1, take_num);
 
         match self.rec_manager.take_asset(file_name.clone()) {
@@ -448,7 +444,6 @@ impl AppState {
         }
     }
 
-    /// Convert a recording track into a full DrumTrack (removes the rec row).
     pub fn promote_rec_to_drum(&self, rec_idx: usize) {
         let (asset_opt, steps) = {
             let tracks = self.rec_tracks.read();
@@ -461,7 +456,7 @@ impl AppState {
         if let Some(asset) = asset_opt {
             let waveform = self.audio_manager.analyze_waveform(&asset, 400);
             let mut drum = DrumTrack::new(asset.clone(), Some(waveform));
-            drum.steps = steps; // carry over step pattern
+            drum.steps = steps;
             self.drum_tracks.write().push(drum);
             self.rec_tracks.write().remove(rec_idx);
             *self.status.write() = format!("✓ Promoted '{}' to drum track", asset.file_name);
@@ -515,7 +510,8 @@ impl AppState {
 
             for (track_idx, track) in tracks.iter().enumerate() {
                 if track.muted { continue; }
-                let chop_marks = self.samples_manager.get_marks_for_sample(&track.asset.file_name);
+                // ✅ UUID-based mark lookup — only sees this track's chops
+                let chop_marks = self.samples_manager.get_marks_for_sample(&track.sample_uuid);
 
                 if !chop_marks.is_empty() {
                     let channels    = track.asset.channels as usize;
@@ -548,14 +544,12 @@ impl AppState {
                             }
                         };
 
-                        // ── PIANO ROLL: fired if the chop has any notes ───
                         let has_piano_notes = track.chop_piano_notes
                             .get(chop_idx)
                             .map(|n| !n.is_empty())
                             .unwrap_or(false);
 
                         if has_piano_notes {
-                            // Fire every note whose step matches the current step
                             let piano_notes_now: Vec<PianoRollNote> = track.chop_piano_notes
                                 .get(chop_idx)
                                 .map(|notes| {
@@ -569,15 +563,13 @@ impl AppState {
                             for note in &piano_notes_now {
                                 let mut voice = Voice::new(
                                     pcm.clone(), channels, start_frame,
-                                    note.speed(),  // ← pitch shift!
+                                    note.speed(),
                                     adsr, chop_adsr_on,
                                 );
                                 voice.end_frame = end_frame;
                                 voices.push(voice);
                             }
-
                         } else {
-                            // ── Fallback: regular step-sequencer on/off ───
                             let fires = if Some(track_idx) == main_idx {
                                 self.seq_grid.read()[step].contains(&chop_idx)
                             } else {
@@ -594,9 +586,7 @@ impl AppState {
                             }
                         }
                     }
-
                 } else if track.steps[step] {
-                    // Whole-sample trigger (no chops)
                     let channels = track.asset.channels as usize;
                     voices.push(Voice::new(
                         Arc::new(track.asset.pcm.clone()),
@@ -605,6 +595,7 @@ impl AppState {
                 }
             }
         }
+
         {
             let rec_tracks = self.rec_tracks.read();
             for track in rec_tracks.iter() {
@@ -615,7 +606,7 @@ impl AppState {
                     voices.push(crate::adsr::Voice::new(
                         Arc::new(asset.pcm.clone()),
                         channels,
-                        0, // play from beginning each step
+                        0,
                         1.0,
                         track.adsr,
                         track.adsr_enabled,
@@ -630,7 +621,6 @@ impl AppState {
                 active.extend(voices);
             }
         }
-
     }
 
     fn ensure_seq_stream(&self) {
@@ -715,7 +705,7 @@ impl AppState {
     }
 }
 
-// ── Stream infrastructure (unchanged) ────────────────────────────────────────
+// ── Stream infrastructure ─────────────────────────────────────────────────────
 
 struct StreamArgs {
     channels: u16, pcm: Vec<f32>,

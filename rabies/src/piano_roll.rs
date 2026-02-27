@@ -1,30 +1,14 @@
 // src/piano_roll.rs
-//
-// Per-chop piano roll — FL-Studio style keyboard grid for each chop.
-// Right-click a chop row label → "🎹 Piano Roll" to open this window.
-// Notes placed here play back as pitch-shifted voices via the sequencer.
-//
-// Files to touch (see comments at bottom for exact lines):
-//   main.rs          → `mod piano_roll;`
-//   gui/mod.rs       → add fields + update tick_sequencer
-//   gui/ui/view.rs   → call `self.draw_chop_piano_roll(ctx);`
-//   gui/ui/panels.rs → right-click context menu on chop label
-
 use eframe::egui;
 use std::sync::atomic::Ordering;
 use crate::gui::{AppState, NUM_STEPS};
 use crate::gui::ui::widgets::pad_color;
 
-// ── Public data model (also used by gui/mod.rs) ───────────────────────────────
-
-/// A pitched note in a chop's piano roll.
-/// `semitone` is relative to C4 (0 = C4, 12 = C5, −12 = C3 …).
-/// Playback speed = 2^(semitone / 12).
 #[derive(Clone, Debug)]
 pub struct PianoRollNote {
-    pub step:     usize,  // 0 .. NUM_STEPS-1
-    pub semitone: i32,    // relative to C4
-    pub velocity: f32,    // 0.0–1.0  (note opacity)
+    pub step:     usize,
+    pub semitone: i32,
+    pub velocity: f32,
 }
 
 impl PianoRollNote {
@@ -32,8 +16,6 @@ impl PianoRollNote {
         2f32.powf(self.semitone as f32 / 12.0)
     }
 }
-
-// ── Music helpers ─────────────────────────────────────────────────────────────
 
 pub fn is_black_key(semitone: i32) -> bool {
     let pos = ((semitone % 12) + 12) % 12;
@@ -47,38 +29,34 @@ pub fn semitone_to_name(semitone: i32) -> String {
     format!("{}{}", names[(midi.rem_euclid(12)) as usize], oct)
 }
 
-// ── Grid constants ────────────────────────────────────────────────────────────
-
-pub const SEM_MIN: i32 = -36;  // C1  (bottom row)
-pub const SEM_MAX: i32 =  37;  // C7  (exclusive; highest shown = B6 = +36)
-// total rows = SEM_MAX − SEM_MIN = 73
+pub const SEM_MIN: i32 = -36;
+pub const SEM_MAX: i32 =  37;
 
 const ROW_H:  f32 = 14.0;
 const KEY_W:  f32 = 60.0;
 const STEP_W: f32 = 38.0;
 const HDR_H:  f32 = 22.0;
 
-// ── AppState implementation ───────────────────────────────────────────────────
-
 impl AppState {
-    /// Call every frame from `view.rs::update()` after `draw_piano_roll`.
     pub fn draw_chop_piano_roll(&mut self, ctx: &egui::Context) {
         let open = { *self.piano_roll_chop.read() };
         let (track_idx, chop_idx) = match open { Some(v) => v, None => return };
 
-        // Snapshot display data before entering UI (avoids holding RwLock during draw)
-        let (file_name, dur_secs, chop_col) = {
+        // ✅ Capture sample_uuid along with display data
+        let (file_name, dur_secs, chop_col, sample_uuid) = {
             let tracks = self.drum_tracks.read();
             match tracks.get(track_idx) {
                 Some(t) => (
                     t.asset.file_name.clone(),
                     t.asset.frames as f32 / t.asset.sample_rate as f32,
                     pad_color(chop_idx),
+                    t.sample_uuid,  // ✅ the track's UUID
                 ),
                 None => { *self.piano_roll_chop.write() = None; return; }
             }
         };
-        let marks    = self.samples_manager.get_marks_for_sample(&file_name);
+        // ✅ Look up marks by UUID — won't bleed from same-filename tracks
+        let marks    = self.samples_manager.get_marks_for_sample(&sample_uuid);
         let mark_pos = marks.get(chop_idx).map(|m| m.position * dur_secs).unwrap_or(0.0);
 
         let seq_playing  = self.seq_playing.load(Ordering::Relaxed);
@@ -87,9 +65,7 @@ impl AppState {
         let total_rows = (SEM_MAX - SEM_MIN) as usize;
         let grid_w     = STEP_W * NUM_STEPS as f32;
         let grid_h     = ROW_H  * total_rows as f32;
-
-        // Start scroll so C4 is visible near the middle
-        let c4_row_y   = (SEM_MAX - 1) as f32 * ROW_H;   // y offset of C4 row
+        let c4_row_y   = (SEM_MAX - 1) as f32 * ROW_H;
         let init_scroll = (c4_row_y - 150.0).max(0.0);
 
         let mut window_open = true;
@@ -106,7 +82,6 @@ impl AppState {
         .open(&mut window_open)
         .show(ctx, |ui| {
 
-            // ── Toolbar ───────────────────────────────────────────────────
             ui.horizontal(|ui| {
                 let (lbl, col) = if seq_playing {
                     ("⏹ Stop", egui::Color32::from_rgb(220, 80, 60))
@@ -200,10 +175,8 @@ impl AppState {
                     let p         = ui.painter_at(outer);
                     let grid_orig = egui::pos2(outer.min.x + KEY_W, outer.min.y + HDR_H);
 
-                    // Background
                     p.rect_filled(outer, 0.0, egui::Color32::from_rgb(13, 13, 19));
 
-                    // ── Step-number header ────────────────────────────────
                     for step in 0..NUM_STEPS {
                         let x  = grid_orig.x + step as f32 * STEP_W;
                         let hr = egui::Rect::from_min_size(
@@ -228,7 +201,6 @@ impl AppState {
                         }
                     }
 
-                    // ── Piano key + grid rows ─────────────────────────────
                     for row_i in 0..total_rows {
                         let semitone  = SEM_MAX - 1 - row_i as i32;
                         let y         = grid_orig.y + row_i as f32 * ROW_H;
@@ -237,7 +209,6 @@ impl AppState {
                         let is_c      = note_pos == 0;
                         let is_c4     = semitone == 0;
 
-                        // ── Piano key ─────────────────────────────────────
                         let key_rect = egui::Rect::from_min_size(
                             egui::pos2(outer.min.x, y),
                             egui::vec2(KEY_W - 2.0, ROW_H - 0.5),
@@ -245,7 +216,6 @@ impl AppState {
 
                         if black {
                             p.rect_filled(key_rect, 0.0, egui::Color32::from_rgb(28, 28, 36));
-                            // Black-key dark face (shorter)
                             let face = egui::Rect::from_min_size(
                                 key_rect.min + egui::vec2(2.0, 0.0),
                                 egui::vec2(KEY_W * 0.6, ROW_H - 0.5),
@@ -253,7 +223,6 @@ impl AppState {
                             p.rect_filled(face, 0.0, egui::Color32::from_rgb(16, 16, 22));
                         } else {
                             p.rect_filled(key_rect, 0.0, egui::Color32::from_rgb(205, 205, 215));
-                            // Key bottom shadow
                             let bot = egui::Rect::from_min_size(
                                 egui::pos2(key_rect.min.x, key_rect.max.y - 2.0),
                                 egui::vec2(KEY_W - 2.0, 2.0),
@@ -262,7 +231,6 @@ impl AppState {
                         }
                         p.rect_stroke(key_rect, 0.0, egui::Stroke::new(0.4, egui::Color32::from_gray(48)));
 
-                        // C4 gets a special orange dot marker
                         if is_c4 {
                             p.circle_filled(
                                 egui::pos2(key_rect.right() - 6.0, key_rect.center().y),
@@ -271,7 +239,6 @@ impl AppState {
                             );
                         }
 
-                        // Note labels: C notes + every E and B (helps reading)
                         if is_c || note_pos == 4 || note_pos == 11 {
                             p.text(
                                 egui::pos2(key_rect.right() - 3.0, key_rect.center().y),
@@ -283,8 +250,7 @@ impl AppState {
                             );
                         }
 
-                        // ── Grid row background ───────────────────────────
-                        let row_bg = if is_c4     { egui::Color32::from_rgb(30, 26, 18) } // orange-ish for C4
+                        let row_bg = if is_c4     { egui::Color32::from_rgb(30, 26, 18) }
                                      else if is_c { egui::Color32::from_rgb(22, 24, 36) }
                                      else if black{ egui::Color32::from_rgb(14, 14, 21) }
                                      else         { egui::Color32::from_rgb(18, 18, 27) };
@@ -303,7 +269,6 @@ impl AppState {
                             );
                         }
                         if is_c4 {
-                            // Subtle orange bottom border for C4
                             p.hline(
                                 egui::Rangef::new(grid_orig.x, grid_orig.x + grid_w),
                                 y + ROW_H - 1.5,
@@ -311,7 +276,6 @@ impl AppState {
                             );
                         }
 
-                        // Beat vertical dividers + playhead tint per cell
                         for step in 0..NUM_STEPS {
                             let x = grid_orig.x + step as f32 * STEP_W;
                             if step % 4 == 0 {
@@ -332,14 +296,12 @@ impl AppState {
                         }
                     }
 
-                    // Outer grid border
                     p.rect_stroke(
                         egui::Rect::from_min_size(grid_orig, egui::vec2(grid_w, grid_h)),
                         0.0,
                         egui::Stroke::new(0.5, egui::Color32::from_gray(42)),
                     );
 
-                    // ── Draw placed notes ─────────────────────────────────
                     let notes: Vec<PianoRollNote> = {
                         let tracks = self.drum_tracks.read();
                         tracks.get(track_idx)
@@ -361,7 +323,6 @@ impl AppState {
                         p.rect_filled(nr, 2.5,
                             egui::Color32::from_rgba_unmultiplied(
                                 chop_col.r(), chop_col.g(), chop_col.b(), alpha));
-                        // Shine
                         p.hline(
                             egui::Rangef::new(nr.left() + 3.0, nr.right() - 3.0),
                             nr.top() + 1.5,
@@ -371,7 +332,6 @@ impl AppState {
                             egui::Stroke::new(0.8, egui::Color32::from_rgba_unmultiplied(255,255,255,55)));
                     }
 
-                    // Full active-step column overlay
                     if seq_playing {
                         let sx = grid_orig.x + current_step as f32 * STEP_W;
                         p.rect_filled(
@@ -384,7 +344,6 @@ impl AppState {
                         );
                     }
 
-                    // ── Click interaction ─────────────────────────────────
                     let grid_rect = egui::Rect::from_min_size(
                         grid_orig,
                         egui::vec2(grid_w, grid_h),
@@ -412,21 +371,18 @@ impl AppState {
                                         if let Some(idx) = existing {
                                             notes.remove(idx);
                                         } else if gresp.clicked() {
-                                            // Left-click adds
                                             notes.push(PianoRollNote {
                                                 step,
                                                 semitone,
                                                 velocity: 1.0,
                                             });
                                         }
-                                        // Right-click already removed above; no-op if not found
                                     }
                                 }
                             }
                         }
                     }
 
-                    // ── Hover: row highlight + tooltip ────────────────────
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                         if grid_rect.contains(pos) {
                             let row_i    = (((pos.y - grid_orig.y) / ROW_H) as usize)
@@ -434,7 +390,6 @@ impl AppState {
                             let semitone = SEM_MAX - 1 - row_i as i32;
                             let speed    = 2f32.powf(semitone as f32 / 12.0);
 
-                            // Row highlight
                             let hy = grid_orig.y + row_i as f32 * ROW_H;
                             p.rect_filled(
                                 egui::Rect::from_min_size(
@@ -445,7 +400,6 @@ impl AppState {
                                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 9),
                             );
 
-                            // Tooltip
                             let tip     = format!("{}  (speed ×{:.3})", semitone_to_name(semitone), speed);
                             let tip_pos = egui::pos2(pos.x + 14.0, pos.y - 7.0);
                             let galley  = p.layout_no_wrap(

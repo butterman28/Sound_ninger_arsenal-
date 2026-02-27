@@ -1,13 +1,4 @@
 // src/recording.rs
-//
-// Recording track support — captures audio from any soundcard input device
-// (enumerates all cpal hosts: WASAPI, ASIO, CoreAudio, ALSA, etc.)
-//
-// Integration points:
-//   main.rs          → add `mod recording;`
-//   gui/mod.rs       → add fields + methods (see CHANGES-gui-mod.rs)
-//   gui/ui/panels.rs → add draw_recording_tracks call (see CHANGES-panels.rs)
-
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::RwLock;
@@ -16,37 +7,29 @@ use crate::audio::AudioAsset;
 use crate::gui::NUM_STEPS;
 use crate::adsr::ADSREnvelope;
 
-// ── Public data model ─────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecordState {
-    Idle,       // no recording yet
-    Recording,  // currently capturing
-    Recorded,   // has audio, ready for sequencer
+    Idle,
+    Recording,
+    Recorded,
 }
 
-/// A single audio input device entry across any host.
 #[derive(Clone, Debug)]
 pub struct InputDevice {
     pub host_id:     cpal::HostId,
-    pub host_name:   String,   // e.g. "Wasapi"
-    pub device_name: String,   // e.g. "Microphone (USB Audio)"
-    /// Human-readable combo label: "Wasapi: Microphone (USB Audio)"
+    pub host_name:   String,
+    pub device_name: String,
     pub label: String,
 }
 
-/// A recording track row in the step sequencer.
 pub struct RecordingTrack {
-    /// The label of the chosen InputDevice (used to look up on playback/re-open)
     pub device_label: Option<String>,
     pub state:        RecordState,
-    /// Captured audio (available after recording stops)
     pub asset:        Option<Arc<AudioAsset>>,
     pub steps:        [bool; NUM_STEPS],
     pub adsr:         ADSREnvelope,
     pub adsr_enabled: bool,
     pub muted:        bool,
-    /// Counter for unique filename generation
     pub take_number:  u32,
 }
 
@@ -64,13 +47,11 @@ impl RecordingTrack {
         }
     }
 
-    /// Short display name: asset filename → device label → fallback
     pub fn short_name(&self) -> String {
         if let Some(a) = &self.asset {
             let n = &a.file_name;
             if n.len() > 15 { format!("{}…", &n[..13]) } else { n.clone() }
         } else if let Some(lbl) = &self.device_label {
-            // Show only the device part after ": "
             let dev = lbl.split(": ").nth(1).unwrap_or(lbl);
             if dev.len() > 15 { format!("{}…", &dev[..13]) } else { dev.to_string() }
         } else {
@@ -78,26 +59,17 @@ impl RecordingTrack {
         }
     }
 
-    /// Duration in seconds if recorded
     pub fn duration_secs(&self) -> Option<f32> {
         self.asset.as_ref().map(|a| a.frames as f32 / a.sample_rate as f32)
     }
 }
 
-// ── RecordingManager ──────────────────────────────────────────────────────────
-//
-// One global instance lives in AppState.  Only one track can record at a time
-// (most hardware enforces this anyway).  After `stop()`, call `take_asset()` to
-// move the PCM into the track.
-
 pub struct RecordingManager {
     pub buffer:       Arc<Mutex<Vec<f32>>>,
     pub is_recording: Arc<AtomicBool>,
-    /// Owned stream — dropped here stops the audio thread
     pub stream:       Arc<RwLock<Option<cpal::Stream>>>,
     pub sample_rate:  Arc<RwLock<u32>>,
     pub channels:     Arc<RwLock<u16>>,
-    /// Peak absolute sample value in the last callback (0.0–1.0)
     pub peak:         Arc<RwLock<f32>>,
 }
 
@@ -113,10 +85,6 @@ impl RecordingManager {
         }
     }
 
-    // ── Device enumeration ────────────────────────────────────────────────────
-
-    /// Returns every input device on every available host.
-    /// Call from a background thread if the device list might block.
     pub fn list_input_devices() -> Vec<InputDevice> {
         let mut out = Vec::new();
         for host_id in cpal::available_hosts() {
@@ -139,10 +107,7 @@ impl RecordingManager {
         out
     }
 
-    // ── Recording ─────────────────────────────────────────────────────────────
-
     pub fn start(&self, dev: &InputDevice) -> Result<(), String> {
-        // Stop any existing capture first
         self.stop();
 
         let host = cpal::host_from_id(dev.host_id)
@@ -159,13 +124,11 @@ impl RecordingManager {
         *self.sample_rate.write() = cfg.sample_rate().0;
         *self.channels.write()    = cfg.channels();
 
-        // Clear the capture buffer
         self.buffer.lock().unwrap().clear();
         self.is_recording.store(true, Ordering::Relaxed);
 
         let scfg: cpal::StreamConfig = cfg.clone().into();
 
-        // Build an input stream that converts any sample format to f32
         let stream = {
             let buf  = self.buffer.clone();
             let rec  = self.is_recording.clone();
@@ -221,7 +184,6 @@ impl RecordingManager {
 
     pub fn stop(&self) {
         self.is_recording.store(false, Ordering::Relaxed);
-        // Dropping the stream stops the audio callback
         *self.stream.write() = None;
         *self.peak.write() = 0.0;
     }
@@ -234,8 +196,6 @@ impl RecordingManager {
         *self.peak.read()
     }
 
-    /// Moves the captured PCM out of the buffer and wraps it in an AudioAsset.
-    /// Returns None if nothing was recorded.
     pub fn take_asset(&self, file_name: String) -> Option<Arc<AudioAsset>> {
         let pcm = {
             let mut buf = self.buffer.lock().ok()?;
@@ -246,11 +206,14 @@ impl RecordingManager {
         let ch = *self.channels.read();
         Some(Arc::new(AudioAsset {
             frames: pcm.len() as u64 / ch.max(1) as u64,
-            pcm, sample_rate: sr, channels: ch, file_name,
+            pcm,
+            sample_rate: sr,
+            channels: ch,
+            file_name,
+            sample_uuid: uuid::Uuid::new_v4(), // ✅ fresh UUID for every recording
         }))
     }
 
-    /// How many seconds have been captured so far (approximate).
     pub fn recorded_secs(&self) -> f32 {
         let sr = *self.sample_rate.read() as f32;
         let ch = (*self.channels.read()).max(1) as f32;

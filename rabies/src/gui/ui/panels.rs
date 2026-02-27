@@ -63,23 +63,18 @@ impl AppState {
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(38)));
 
         frame.show(ui, |ui| {
-            // ── Sticky header — always visible regardless of scroll ───────
             self.seq_header_ui(ui);
-
-            // Thin separator line under the header
             ui.add(egui::Separator::default().horizontal().spacing(4.0));
 
             let current_step = *self.seq_current_step.read();
             let seq_playing  = self.seq_playing.load(Ordering::Relaxed);
 
-            // ── Scrollable body ───────────────────────────────────────────
             egui::ScrollArea::vertical()
                 .id_source("seq_body_scroll")
                 .auto_shrink([false, true])
                 .max_height(500.0)
                 .show(ui, |ui| {
 
-                // Beat-number header row (inside scroll so it stays with steps)
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.add_space(label_w + 8.0);
@@ -96,7 +91,6 @@ impl AppState {
                     }
                 });
 
-                // ── All drum tracks ───────────────────────────────────────
                 let n_drums  = self.drum_tracks.read().len();
                 let main_idx = *self.main_track_index.read();
                 if n_drums > 0 {
@@ -107,17 +101,23 @@ impl AppState {
                 for drum_idx in 0..n_drums {
                     let color     = drum_color(drum_idx);
                     let color_dim = drum_color_dim(drum_idx);
-                    let (file_name, time_str, muted) = {
+
+                    // ✅ Extract sample_uuid alongside other track info
+                    let (file_name, time_str, muted, sample_uuid) = {
                         let tracks = self.drum_tracks.read();
                         let t = &tracks[drum_idx];
-                        (t.asset.file_name.clone(),
-                         format!("{:.2}s", t.asset.frames as f32 / t.asset.sample_rate as f32),
-                         t.muted)
+                        (
+                            t.asset.file_name.clone(),
+                            format!("{:.2}s", t.asset.frames as f32 / t.asset.sample_rate as f32),
+                            t.muted,
+                            t.sample_uuid,  // ✅ track's UUID, not filename
+                        )
                     };
                     let is_focused = matches!(self.waveform_focus.read().clone(),
                         WaveformFocus::DrumTrack(i) if i == drum_idx);
 
-                    let chop_marks = self.samples_manager.get_marks_for_sample(&file_name);
+                    // ✅ Look up chops by UUID — never bleed across same-name tracks
+                    let chop_marks = self.samples_manager.get_marks_for_sample(&sample_uuid);
                     let has_chops  = !chop_marks.is_empty();
 
                     {
@@ -126,7 +126,6 @@ impl AppState {
                             t.ensure_chop_steps(chop_marks.len());
                         }
                     }
-
 
                     // Main track step row + ADSR
                     {
@@ -326,7 +325,8 @@ impl AppState {
                                 }
 
                                 {
-                                    let all_marks = self.samples_manager.get_marks_for_sample(&file_name);
+                                    // ✅ Use sample_uuid for "ToMarker" dropdown too
+                                    let all_marks = self.samples_manager.get_marks_for_sample(&sample_uuid);
                                     let is_to_marker = matches!(play_mode, crate::gui::ChopPlayMode::ToMarker(_));
                                     let current_target_id: Option<usize> = if let crate::gui::ChopPlayMode::ToMarker(id) = play_mode { Some(id) } else { None };
                                     let col = if is_to_marker { chop_color } else { egui::Color32::from_gray(80) };
@@ -401,7 +401,6 @@ impl AppState {
                     ui.add_space(2.0);
                 } // for drum_idx
 
-                // Recording tracks
                 self.draw_recording_tracks(ui, current_step, seq_playing, step_w, row_h, label_w);
 
                 if n_drums == 0 && self.rec_tracks.read().is_empty() {
@@ -414,8 +413,8 @@ impl AppState {
                     "Click steps to toggle  ·  Click label to focus/preview  ·  Right-click for options  ·  Drag knobs to shape ADSR")
                     .small().color(egui::Color32::from_gray(58)));
 
-                }); // end ScrollArea
-        }); // end frame
+                });
+        });
     }
 
     pub fn draw_recording_tracks(
@@ -452,7 +451,6 @@ impl AppState {
             let peak      = if is_active { self.rec_manager.peak() } else { 0.0 };
             let rec_secs  = if is_active { self.rec_manager.recorded_secs() } else { 0.0 };
 
-            // Row A: label + steps
             ui.horizontal(|ui| {
                 let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
                 let border_col = if is_active { egui::Color32::from_rgb(255, 60, 60) }
@@ -534,7 +532,6 @@ impl AppState {
                 }
             });
 
-            // Row B: device + rec/stop + promote
             ui.horizontal(|ui| {
                 let (ls, _) = ui.allocate_exact_size(egui::vec2(label_w, knob_h), egui::Sense::hover());
                 ui.painter().rect_filled(ls, 0.0, egui::Color32::from_rgb(14, 9, 9));
@@ -610,15 +607,21 @@ impl AppState {
         if !*self.piano_roll_open.read() { return; }
         let focus = self.waveform_focus.read().clone();
         let WaveformFocus::DrumTrack(idx) = focus else { return; };
-        let tracks = self.drum_tracks.read();
-        let Some(track) = tracks.get(idx) else { return; };
-        let asset = &track.asset;
+        let (file_name, dur, sample_uuid) = {
+            let tracks = self.drum_tracks.read();
+            let Some(track) = tracks.get(idx) else { return; };
+            (
+                track.asset.file_name.clone(),
+                track.asset.frames as f32 / track.asset.sample_rate as f32,
+                track.sample_uuid,  // ✅ UUID for this track instance
+            )
+        };
         let main_idx = *self.main_track_index.read();
-        let marks = self.samples_manager.get_marks_for_sample(&asset.file_name);
-        let dur = asset.frames as f32 / asset.sample_rate as f32;
-        
+        // ✅ Use UUID — not filename — to look up this track's chops only
+        let marks = self.samples_manager.get_marks_for_sample(&sample_uuid);
+
         let mut window_open = true;
-        egui::Window::new(format!("🎹 Piano Roll — {}", asset.file_name))
+        egui::Window::new(format!("🎹 Piano Roll — {}", file_name))
             .id(egui::Id::new("piano_roll_window"))
             .default_size([820.0, 400.0])
             .min_size([500.0, 260.0])
@@ -646,14 +649,14 @@ impl AppState {
                 });
                 ui.separator();
                 ui.add_space(4.0);
-                
+
                 if marks.is_empty() {
                     ui.centered_and_justified(|ui| {
                         ui.label(egui::RichText::new("No chops yet!\nPlay your sample and press M to drop markers.").size(13.0).color(egui::Color32::from_gray(140)));
                     });
                     return;
                 }
-                
+
                 let pad_label_w = 165.0;
                 let avail = ui.available_size();
                 let grid_w = (avail.x - pad_label_w - 14.0).max(200.0);
@@ -663,13 +666,13 @@ impl AppState {
                 let header_h = 18.0;
                 let grid_h = n_rows as f32 * cell_h + header_h;
                 let current_step = *self.seq_current_step.read();
-                
+
                 egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
                     let (outer_rect, _) = ui.allocate_exact_size(egui::vec2(pad_label_w + grid_w + 8.0, grid_h + 4.0), egui::Sense::hover());
                     let painter = ui.painter_at(outer_rect);
                     painter.rect_filled(outer_rect, 0.0, egui::Color32::from_rgb(13, 13, 19));
                     let grid_origin = egui::pos2(outer_rect.min.x + pad_label_w, outer_rect.min.y + header_h);
-                    
+
                     for step in 0..NUM_STEPS {
                         let x = grid_origin.x + step as f32 * cell_w;
                         let hr = egui::Rect::from_min_size(egui::pos2(x, outer_rect.min.y), egui::vec2(cell_w-1.0, header_h-1.0));
@@ -681,7 +684,7 @@ impl AppState {
                             painter.rect_filled(hr, 0.0, egui::Color32::from_rgba_unmultiplied(255,220,80,38));
                         }
                     }
-                    
+
                     for (pad_idx, mark) in marks.iter().enumerate() {
                         let time_at = mark.position * dur;
                         let color = pad_color(pad_idx);
@@ -693,19 +696,22 @@ impl AppState {
                         painter.text(egui::pos2(lr.min.x+15.0, lr.center().y-6.0), egui::Align2::LEFT_CENTER, format!("Chop #{}", mark.id), egui::FontId::proportional(12.0), color);
                         painter.text(egui::pos2(lr.min.x+15.0, lr.center().y+7.0), egui::Align2::LEFT_CENTER, format!("{:.3}s", time_at), egui::FontId::proportional(9.0), egui::Color32::from_gray(105));
                         painter.hline(outer_rect.x_range(), y + cell_h - 0.5, egui::Stroke::new(0.5, egui::Color32::from_gray(26)));
-                        
+
                         for step in 0..NUM_STEPS {
                             let x = grid_origin.x + step as f32 * cell_w;
                             let cell = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell_w-1.0, cell_h-1.0));
                             let grp = step / 4;
                             painter.rect_filled(cell, 0.0, if grp%2==0{egui::Color32::from_rgb(19,19,27)}else{egui::Color32::from_rgb(16,16,24)});
-                            
+
+                            let tracks = self.drum_tracks.read();
+                            let track = tracks.get(idx);
                             let is_on = if Some(idx) == main_idx {
                                 self.seq_grid.read()[step].contains(&pad_idx)
                             } else {
-                                track.chop_steps.get(pad_idx).map(|s| s[step]).unwrap_or(false)
+                                track.and_then(|t| t.chop_steps.get(pad_idx)).map(|s| s[step]).unwrap_or(false)
                             };
-                            
+                            drop(tracks);
+
                             if is_on {
                                 painter.rect_filled(cell.shrink(2.0), 3.0, color);
                                 painter.hline(cell.shrink(2.0).x_range(), cell.shrink(2.0).top()+1.5, egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255,255,255,70)));
@@ -719,7 +725,7 @@ impl AppState {
                             painter.vline(x, egui::Rangef::new(y, y+cell_h), egui::Stroke::new(0.5, lc));
                         }
                     }
-                    
+
                     let grid_rect = egui::Rect::from_min_size(grid_origin, egui::vec2(grid_w, n_rows as f32 * cell_h));
                     let gresp = ui.interact(grid_rect, egui::Id::new("pr_grid"), egui::Sense::click_and_drag());
                     if gresp.clicked() || gresp.dragged() {
