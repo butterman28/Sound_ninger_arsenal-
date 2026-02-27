@@ -9,7 +9,8 @@ use atomic_float::AtomicF32;
 use crate::audio::{AudioAsset, AudioManager, WaveformAnalysis};
 use crate::samples::{SamplesManager, PlaybackMode};
 use crate::adsr::{ADSREnvelope, Voice};
-use crate::piano_roll::PianoRollNote;   // ← NEW
+use crate::piano_roll::PianoRollNote; 
+use crate::recording::{RecordingManager, RecordingTrack, RecordState};
 
 pub const NUM_STEPS: usize = 16;
 
@@ -29,7 +30,7 @@ pub struct DrumTrack {
     pub chop_adsr: Vec<ADSREnvelope>,
     pub chop_adsr_enabled: Vec<bool>,
     pub chop_play_modes: Vec<ChopPlayMode>,
-    pub chop_piano_notes: Vec<Vec<PianoRollNote>>,  // ← NEW: per-chop note lists
+    pub chop_piano_notes: Vec<Vec<PianoRollNote>>,
     pub muted: bool,
     pub adsr: ADSREnvelope,
     pub adsr_enabled: bool,
@@ -108,6 +109,13 @@ pub struct AppState {
     pub piano_roll_open: Arc<RwLock<bool>>,
     pub piano_roll_chop: Arc<RwLock<Option<(usize, usize)>>>,  // ← NEW: (track_idx, chop_idx)
     pub main_track_index: Arc<RwLock<Option<usize>>>,
+    pub rec_manager:        Arc<RecordingManager>,
+    pub rec_tracks:         Arc<RwLock<Vec<RecordingTrack>>>,
+    /// Which rec_track index is currently recording (if any)
+    pub rec_active_track:   Arc<RwLock<Option<usize>>>,
+    /// Cached list of input devices (refreshed on demand)
+    pub input_devices:      Arc<RwLock<Vec<crate::recording::InputDevice>>>,
+
 }
 
 impl Default for AppState {
@@ -141,8 +149,12 @@ impl Default for AppState {
             seq_voice_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             waveform_focus: Arc::new(RwLock::new(WaveformFocus::MainSample)),
             piano_roll_open: Arc::new(RwLock::new(false)),
-            piano_roll_chop: Arc::new(RwLock::new(None)),  // ← NEW
+            piano_roll_chop: Arc::new(RwLock::new(None)),
             main_track_index: Arc::new(RwLock::new(None)),
+            rec_manager:      Arc::new(RecordingManager::new()),
+            rec_tracks:       Arc::new(RwLock::new(Vec::new())),
+            rec_active_track: Arc::new(RwLock::new(None)),
+            input_devices:    Arc::new(RwLock::new(Vec::new())),
         }
     }
 }
@@ -264,7 +276,7 @@ impl AppState {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Audio", &["mp3","wav","flac","ogg","m4a","aac"])
             .pick_file()
-        {
+        {   
             let audio_manager    = self.audio_manager.clone();
             let drum_tracks      = self.drum_tracks.clone();
             let drum_loading     = self.drum_loading.clone();
@@ -335,6 +347,124 @@ impl AppState {
             *self.waveform_focus.write()    = WaveformFocus::DrumTrack(track_idx);
             *self.waveform_analysis.write() = track.waveform.clone();
             *self.status.write()            = format!("Viewing: {}", track.asset.file_name);
+        }
+    }
+
+     /// Refresh the cached list of input devices (spawns no thread; call from UI).
+    pub fn refresh_input_devices(&self) {
+        *self.input_devices.write() = RecordingManager::list_input_devices();
+    }
+
+    /// Add a new, empty recording track row.
+    pub fn add_rec_track(&self) {
+        if self.input_devices.read().is_empty() {
+            self.refresh_input_devices();
+        }
+        self.rec_tracks.write().push(RecordingTrack::new());
+    }
+
+    /// Begin capturing from the device selected for `track_idx`.
+    pub fn start_recording(&self, track_idx: usize) {
+        // Only one recording at a time
+        if self.rec_manager.is_recording() {
+            *self.status.write() = "Already recording — stop current recording first".to_string();
+            return;
+        }
+
+        let dev_label = {
+            let tracks = self.rec_tracks.read();
+            tracks.get(track_idx).and_then(|t| t.device_label.clone())
+        };
+        let dev_label = match dev_label {
+            Some(l) => l,
+            None => { *self.status.write() = "Select an input device first".to_string(); return; }
+        };
+
+        let dev = {
+            let devices = self.input_devices.read();
+            devices.iter().find(|d| d.label == dev_label).cloned()
+        };
+        let dev = match dev {
+            Some(d) => d,
+            None => {
+                *self.status.write() = format!("Device '{}' not found — try Refresh", dev_label);
+                return;
+            }
+        };
+
+        match self.rec_manager.start(&dev) {
+            Ok(()) => {
+                *self.rec_active_track.write() = Some(track_idx);
+                if let Some(t) = self.rec_tracks.write().get_mut(track_idx) {
+                    t.state = RecordState::Recording;
+                }
+                *self.status.write() = format!("🔴 Recording from {}", dev.device_name);
+            }
+            Err(e) => {
+                *self.status.write() = format!("Record error: {}", e);
+            }
+        }
+    }
+
+    /// Stop capturing and store the PCM in the track's asset.
+    pub fn stop_recording(&self, track_idx: usize) {
+        self.rec_manager.stop();
+        *self.rec_active_track.write() = None;
+
+        let (dev_label, take_num) = {
+            let tracks = self.rec_tracks.read();
+            let t = tracks.get(track_idx);
+            (
+                t.and_then(|t| t.device_label.clone()).unwrap_or_else(|| "rec".into()),
+                t.map(|t| t.take_number).unwrap_or(1),
+            )
+        };
+
+        // Sanitise device label into a filename-safe string
+        let safe: String = dev_label
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .take(20)
+            .collect();
+        let file_name = format!("rec{}_take{}.wav", track_idx + 1, take_num);
+
+        match self.rec_manager.take_asset(file_name.clone()) {
+            Some(asset) => {
+                let dur = asset.frames as f32 / asset.sample_rate as f32;
+                let mut tracks = self.rec_tracks.write();
+                if let Some(t) = tracks.get_mut(track_idx) {
+                    t.asset = Some(asset);
+                    t.state = RecordState::Recorded;
+                    t.take_number += 1;
+                }
+                *self.status.write() = format!("✓ Recorded {:.2}s → {}", dur, file_name);
+            }
+            None => {
+                if let Some(t) = self.rec_tracks.write().get_mut(track_idx) {
+                    t.state = RecordState::Idle;
+                }
+                *self.status.write() = "Recording was empty".to_string();
+            }
+        }
+    }
+
+    /// Convert a recording track into a full DrumTrack (removes the rec row).
+    pub fn promote_rec_to_drum(&self, rec_idx: usize) {
+        let (asset_opt, steps) = {
+            let tracks = self.rec_tracks.read();
+            if let Some(t) = tracks.get(rec_idx) {
+                (t.asset.clone(), t.steps)
+            } else {
+                return;
+            }
+        };
+        if let Some(asset) = asset_opt {
+            let waveform = self.audio_manager.analyze_waveform(&asset, 400);
+            let mut drum = DrumTrack::new(asset.clone(), Some(waveform));
+            drum.steps = steps; // carry over step pattern
+            self.drum_tracks.write().push(drum);
+            self.rec_tracks.write().remove(rec_idx);
+            *self.status.write() = format!("✓ Promoted '{}' to drum track", asset.file_name);
         }
     }
 
@@ -475,6 +605,24 @@ impl AppState {
                 }
             }
         }
+        {
+            let rec_tracks = self.rec_tracks.read();
+            for track in rec_tracks.iter() {
+                if track.muted || track.state != RecordState::Recorded { continue; }
+                if !track.steps[step] { continue; }
+                if let Some(asset) = &track.asset {
+                    let channels = asset.channels as usize;
+                    voices.push(crate::adsr::Voice::new(
+                        Arc::new(asset.pcm.clone()),
+                        channels,
+                        0, // play from beginning each step
+                        1.0,
+                        track.adsr,
+                        track.adsr_enabled,
+                    ));
+                }
+            }
+        }
 
         if !voices.is_empty() {
             self.ensure_seq_stream();
@@ -482,6 +630,7 @@ impl AppState {
                 active.extend(voices);
             }
         }
+
     }
 
     fn ensure_seq_stream(&self) {

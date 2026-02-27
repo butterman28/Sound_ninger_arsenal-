@@ -5,6 +5,7 @@ mod gui;
 mod adsr;
 mod samples;
 mod piano_roll; 
+mod recording; 
 
 use eframe::egui;
 

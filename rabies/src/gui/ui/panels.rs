@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use crate::gui::{AppState, WaveformFocus, NUM_STEPS};
 use super::widgets::*;
 use crate::adsr::ADSREnvelope;
+use crate::recording::RecordState;
 
 impl AppState {
     pub fn seq_header_ui(&mut self, ui: &mut egui::Ui) {
@@ -34,6 +35,13 @@ impl AppState {
                 if ui.add(egui::Button::new(egui::RichText::new("🎹 Piano Roll").small().color(egui::Color32::from_rgb(140,180,255)))).clicked() {
                     *self.piano_roll_open.write() = true;
                 }
+                if ui.add(egui::Button::new(
+                    egui::RichText::new("🎙 Rec Track")
+                        .small()
+                        .color(egui::Color32::from_rgb(220, 80, 80))
+                )).on_hover_text("Add a recording track (capture from any input device)").clicked() {
+                    self.add_rec_track();
+                }
                 if ui.add(egui::Button::new(egui::RichText::new("＋ Add Track").small().color(egui::Color32::from_rgb(80,220,140)))).clicked() {
                     self.load_drum_track();
                 }
@@ -42,487 +50,560 @@ impl AppState {
     }
 
     pub fn draw_step_sequencer(&mut self, ui: &mut egui::Ui) {
-        let label_w    = 130.0;
-        let step_w     = 38.0;
+        let label_w     = 130.0;
+        let step_w      = 38.0;
         let steps_total = step_w * NUM_STEPS as f32;
-        let row_h      = 36.0;
-        let knob_h     = 52.0;
-        
+        let row_h       = 36.0;
+        let knob_h      = 52.0;
+
         let frame = egui::Frame::none()
             .fill(egui::Color32::from_rgb(15, 15, 21))
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .rounding(egui::Rounding::same(6.0))
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(38)));
-        
+
         frame.show(ui, |ui| {
+            // ── Sticky header — always visible regardless of scroll ───────
             self.seq_header_ui(ui);
-            ui.add_space(4.0);
+
+            // Thin separator line under the header
+            ui.add(egui::Separator::default().horizontal().spacing(4.0));
+
             let current_step = *self.seq_current_step.read();
             let seq_playing  = self.seq_playing.load(Ordering::Relaxed);
-            
-            // Beat-number header
-            ui.horizontal(|ui| {
-                ui.add_space(label_w + 8.0);
-                for step in 0..NUM_STEPS {
-                    let sz = egui::vec2(step_w - 2.0, 13.0);
-                    let (r, _) = ui.allocate_exact_size(sz, egui::Sense::hover());
-                    if step % 4 == 0 {
-                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
-                            format!("{}", step / 4 + 1), egui::FontId::proportional(9.0), egui::Color32::from_gray(75));
-                    }
-                    let tc = if step % 4 == 0 { egui::Color32::from_gray(65) } else { egui::Color32::from_gray(38) };
-                    ui.painter().vline(r.left(), r.y_range(), egui::Stroke::new(0.5, tc));
-                }
-            });
-            
-            // ── All tracks (including main) ───────────────────────────────
-            let n_drums = self.drum_tracks.read().len();
-            let main_idx = *self.main_track_index.read();
-            if n_drums > 0 {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("  Tracks").small().color(egui::Color32::from_gray(70)));
-            }
-            
-            for drum_idx in 0..n_drums {
-                let color     = drum_color(drum_idx);
-                let color_dim = drum_color_dim(drum_idx);
-                let (file_name, time_str, muted) = {
-                    let tracks = self.drum_tracks.read();
-                    let t = &tracks[drum_idx];
-                    (t.asset.file_name.clone(),
-                    format!("{:.2}s", t.asset.frames as f32 / t.asset.sample_rate as f32),
-                    t.muted)
-                };
-                let is_focused = matches!(self.waveform_focus.read().clone(), WaveformFocus::DrumTrack(i) if i == drum_idx);
-                
-                // ── CRITICAL: Get chop marks AND ensure arrays are sized ─────────
-                let chop_marks = self.samples_manager.get_marks_for_sample(&file_name);
-                let has_chops = !chop_marks.is_empty();
-                
-                // Ensure DrumTrack has enough chop_steps and chop_adsr entries
-                {
-                    let mut tracks = self.drum_tracks.write();
-                    if let Some(t) = tracks.get_mut(drum_idx) {
-                        t.ensure_chop_steps(chop_marks.len());
-                    }
-                }
-                
-                // Track header
+
+            // ── Scrollable body ───────────────────────────────────────────
+            egui::ScrollArea::vertical()
+                .id_source("seq_body_scroll")
+                .auto_shrink([false, true])
+                .max_height(500.0)
+                .show(ui, |ui| {
+
+                // Beat-number header row (inside scroll so it stays with steps)
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h - 6.0), egui::Sense::click());
-                    let label_bg = if is_focused { egui::Color32::from_rgb(20,30,25) } else { egui::Color32::from_rgb(18,18,26) };
-                    ui.painter().rect_filled(lr, 3.0, label_bg);
-                    ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(
-                        if is_focused { 1.5 } else { 0.8 },
-                        if is_focused { color } else { egui::Color32::from_gray(50) },
-                    ));
-                    ui.painter().rect_filled(egui::Rect::from_min_size(lr.min+egui::vec2(5.0,6.0), egui::vec2(4.0, lr.height()-12.0)), 2.0, color);
-                    let dn = if file_name.len() > 14 { format!("{}…", &file_name[..12]) } else { file_name.clone() };
-                    ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y-4.0), egui::Align2::LEFT_CENTER,
-                        dn, egui::FontId::proportional(10.0), if muted { egui::Color32::from_gray(80) } else { color });
-                    ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y+6.0), egui::Align2::LEFT_CENTER,
-                        format!("{} chops", chop_marks.len()), egui::FontId::proportional(8.0), egui::Color32::from_gray(85));
-                    if lresp.clicked() {
-                        *self.waveform_focus.write() = WaveformFocus::DrumTrack(drum_idx);
-                        *self.status.write() = format!("Previewing: {}", file_name);
+                    ui.add_space(label_w + 8.0);
+                    for step in 0..NUM_STEPS {
+                        let sz = egui::vec2(step_w - 2.0, 13.0);
+                        let (r, _) = ui.allocate_exact_size(sz, egui::Sense::hover());
+                        if step % 4 == 0 {
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
+                                format!("{}", step / 4 + 1), egui::FontId::proportional(9.0),
+                                egui::Color32::from_gray(75));
+                        }
+                        let tc = if step % 4 == 0 { egui::Color32::from_gray(65) } else { egui::Color32::from_gray(38) };
+                        ui.painter().vline(r.left(), r.y_range(), egui::Stroke::new(0.5, tc));
                     }
-                    let drum_tracks_ref = self.drum_tracks.clone();
-                    lresp.context_menu(|ui| {
-                        ui.set_min_width(165.0);
-                        ui.label(egui::RichText::new(&file_name).small().color(egui::Color32::from_gray(140)));
-                        ui.separator();
-                        if ui.button(if muted { "🔊  Unmute" } else { "🔇  Mute" }).clicked() {
-                            if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.muted = !t.muted; }
-                            ui.close_menu();
-                        }
-                        if ui.button("🗑  Clear All Steps").clicked() {
-                            if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) {
-                                t.steps = [false; NUM_STEPS];
-                                for row in t.chop_steps.iter_mut() { *row = [false; NUM_STEPS]; }
-                            }
-                            ui.close_menu();
-                        }
-                        if ui.button("↺  Reset ADSR").clicked() {
-                            if let Some(t) = drum_tracks_ref.write().get_mut(drum_idx) { t.adsr = ADSREnvelope::default(); }
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button(egui::RichText::new("✕  Remove Track").color(egui::Color32::from_rgb(220,80,60))).clicked() {
-                            drum_tracks_ref.write().remove(drum_idx);
-                            ui.close_menu();
-                        }
-                    });
-                    ui.add_space(8.0);
-                    let avail = ui.available_width();
-                    let (hint_rect, _) = ui.allocate_exact_size(egui::vec2(avail, lr.height()), egui::Sense::hover());
-                    ui.painter().rect_filled(hint_rect, 2.0, egui::Color32::from_rgb(14,14,20));
-                    ui.painter().text(hint_rect.center(), egui::Align2::CENTER_CENTER,
-                        "▶ Preview + M to chop  ·  Right-click for options",
-                        egui::FontId::proportional(9.5), egui::Color32::from_gray(55));
                 });
-                
-                // ── ALWAYS show the main track row (steps + ADSR) ─────────────
-                {
-                    let steps = {
+
+                // ── All drum tracks ───────────────────────────────────────
+                let n_drums  = self.drum_tracks.read().len();
+                let main_idx = *self.main_track_index.read();
+                if n_drums > 0 {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("  Tracks").small().color(egui::Color32::from_gray(70)));
+                }
+
+                for drum_idx in 0..n_drums {
+                    let color     = drum_color(drum_idx);
+                    let color_dim = drum_color_dim(drum_idx);
+                    let (file_name, time_str, muted) = {
                         let tracks = self.drum_tracks.read();
-                        tracks.get(drum_idx).map(|t| t.steps).unwrap_or([false; NUM_STEPS])
+                        let t = &tracks[drum_idx];
+                        (t.asset.file_name.clone(),
+                         format!("{:.2}s", t.asset.frames as f32 / t.asset.sample_rate as f32),
+                         t.muted)
                     };
-                    
-                    // Main sample step row
-                    ui.horizontal(|ui| {
-                        let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
-                        let label_bg = if is_focused { egui::Color32::from_rgb(20,30,25) } else { egui::Color32::from_rgb(20,20,28) };
-                        ui.painter().rect_filled(lr, 3.0, if muted { egui::Color32::from_rgb(18,18,22) } else { label_bg });
-                        ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(
-                            if is_focused { 1.5 } else { 1.0 },
-                            if is_focused { color } else { egui::Color32::from_gray(38) },
-                        ));
-                        ui.painter().rect_filled(egui::Rect::from_min_size(lr.min+egui::vec2(5.0, 6.0), egui::vec2(4.0, row_h-12.0)), 2.0,
-                            if muted { egui::Color32::from_gray(50) } else { color });
-                        let dn = if file_name.len() > 14 { format!("{}…", &file_name[..12]) } else { file_name.clone() };
-                        ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y-5.0), egui::Align2::LEFT_CENTER,
-                            dn, egui::FontId::proportional(11.0), if muted { egui::Color32::from_gray(80) } else { color });
-                        ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y+6.0), egui::Align2::LEFT_CENTER,
-                            &time_str, egui::FontId::proportional(8.5), egui::Color32::from_gray(90));
-                        if lresp.clicked() {
-                            *self.waveform_focus.write() = WaveformFocus::DrumTrack(drum_idx);
-                            *self.status.write() = format!("Previewing: {}", file_name);
-                            if let Some(track) = self.drum_tracks.read().get(drum_idx) {
-                                self.playback_position.store(0.0, Ordering::Relaxed);
-                                self.playback_sample_index.store(0, Ordering::Relaxed);
-                                self.start_playback(track.asset.clone());
-                            }
-                        }
-                        ui.add_space(8.0);
-                        draw_step_buttons(ui, step_w, row_h, color, color_dim, &steps, current_step, seq_playing,
-                            &mut |step| {
-                                if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) { t.steps[step] = !t.steps[step]; }
-                            }
-                        );
-                    });
-                    
-                    // Main track ADSR row with enable checkbox
-                    ui.horizontal(|ui| {
-                        let (label_space, _) = ui.allocate_exact_size(egui::vec2(label_w, knob_h), egui::Sense::hover());
-                        ui.painter().rect_filled(label_space, 0.0, egui::Color32::from_rgb(12, 12, 18));
-                        ui.add_space(8.0);
-                        
-                        // ✅ ADSR Enable Checkbox
+                    let is_focused = matches!(self.waveform_focus.read().clone(),
+                        WaveformFocus::DrumTrack(i) if i == drum_idx);
+
+                    let chop_marks = self.samples_manager.get_marks_for_sample(&file_name);
+                    let has_chops  = !chop_marks.is_empty();
+
+                    {
                         let mut tracks = self.drum_tracks.write();
                         if let Some(t) = tracks.get_mut(drum_idx) {
-                            if ui.checkbox(&mut t.adsr_enabled, "ADSR").changed() {
-                                *self.status.write() = if t.adsr_enabled {
-                                    format!("ADSR ON for {}", file_name)
-                                } else {
-                                    format!("ADSR OFF for {} (full volume)", file_name)
-                                };
-                            }
+                            t.ensure_chop_steps(chop_marks.len());
                         }
-                        drop(tracks);
-                        let (knob_rect, _) = ui.allocate_exact_size(egui::vec2(steps_total, knob_h), egui::Sense::hover());
-                        ui.painter().rect_filled(knob_rect, 2.0, egui::Color32::from_rgb(16, 16, 24));
-                        ui.painter().rect_stroke(knob_rect, 2.0, egui::Stroke::new(0.5, egui::Color32::from_gray(30)));
-                        
-                        let adsr_now = self.drum_tracks.read().get(drum_idx).map(|t| t.adsr).unwrap_or_default();
-                        let base_id = egui::Id::new("drum_knob").with(drum_idx);
-                        let painter = ui.painter().clone();
-                        let (new_adsr, adsr_changed) = draw_adsr_knobs(ui, &painter, knob_rect, adsr_now, color, base_id);
-                        if adsr_changed {
-                            if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) { t.adsr = new_adsr; }
-                        }
-                    });
-                }
-                
-                // ── SHOW CHOP ROWS WHEN THEY EXIST ────────────────────────────
-                if has_chops {
-                    for (chop_idx, mark) in chop_marks.iter().enumerate() {
-                        let chop_color = pad_color(chop_idx);
-                        let chop_color_dim = pad_color_dim(chop_idx);
-                        let dur_asset = {
+                    }
+
+
+                    // Main track step row + ADSR
+                    {
+                        let steps = {
                             let tracks = self.drum_tracks.read();
-                            tracks.get(drum_idx).map(|t| t.asset.frames as f32 / t.asset.sample_rate as f32).unwrap_or(0.0)
+                            tracks.get(drum_idx).map(|t| t.steps).unwrap_or([false; NUM_STEPS])
                         };
-                        let time_at = mark.position * dur_asset;
-                        
-                        // Chop row with step buttons
 
                         ui.horizontal(|ui| {
                             let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
-                            ui.painter().rect_filled(lr, 3.0, egui::Color32::from_rgb(17, 17, 25));
-                            ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(0.5, egui::Color32::from_gray(30)));
-                            ui.painter().rect_filled(
-                                egui::Rect::from_min_size(lr.min+egui::vec2(14.0,8.0), egui::vec2(3.0, row_h-16.0)),
-                                1.0, chop_color,
-                            );
-                            // Show 🎹 indicator if this chop has piano notes
-                            let has_piano_notes = {
-                                let tracks = self.drum_tracks.read();
-                                tracks.get(drum_idx)
-                                    .and_then(|t| t.chop_piano_notes.get(chop_idx))
-                                    .map(|n| !n.is_empty())
-                                    .unwrap_or(false)
-                            };
-                            ui.painter().text(egui::pos2(lr.min.x+22.0, lr.center().y-4.0), egui::Align2::LEFT_CENTER,
-                                format!("Chop {}{}", chop_idx + 1, if has_piano_notes { " 🎹" } else { "" }),
-                                egui::FontId::proportional(10.0), chop_color);
-                            ui.painter().text(egui::pos2(lr.min.x+22.0, lr.center().y+5.0), egui::Align2::LEFT_CENTER,
-                                format!("{:.2}s", time_at), egui::FontId::proportional(8.0), egui::Color32::from_gray(85));
+                            let label_bg = if is_focused { egui::Color32::from_rgb(20,30,25) } else { egui::Color32::from_rgb(20,20,28) };
+                            ui.painter().rect_filled(lr, 3.0, if muted { egui::Color32::from_rgb(18,18,22) } else { label_bg });
+                            ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(
+                                if is_focused { 1.5 } else { 1.0 },
+                                if is_focused { color } else { egui::Color32::from_gray(38) },
+                            ));
+                            ui.painter().rect_filled(egui::Rect::from_min_size(lr.min+egui::vec2(5.0, 6.0), egui::vec2(4.0, row_h-12.0)), 2.0,
+                                if muted { egui::Color32::from_gray(50) } else { color });
+                            let dn = if file_name.len() > 14 { format!("{}…", &file_name[..12]) } else { file_name.clone() };
+                            ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y-5.0), egui::Align2::LEFT_CENTER,
+                                dn, egui::FontId::proportional(11.0), if muted { egui::Color32::from_gray(80) } else { color });
+                            ui.painter().text(egui::pos2(lr.min.x+14.0, lr.center().y+6.0), egui::Align2::LEFT_CENTER,
+                                &time_str, egui::FontId::proportional(8.5), egui::Color32::from_gray(90));
                             if lresp.clicked() {
                                 *self.waveform_focus.write() = WaveformFocus::DrumTrack(drum_idx);
+                                *self.status.write() = format!("Previewing: {}", file_name);
+                                if let Some(track) = self.drum_tracks.read().get(drum_idx) {
+                                    self.playback_position.store(0.0, Ordering::Relaxed);
+                                    self.playback_sample_index.store(0, Ordering::Relaxed);
+                                    self.start_playback(track.asset.clone());
+                                }
                             }
-                            // ── Right-click: open piano roll ──────────────────────────
-                            let pr_ref = self.piano_roll_chop.clone();
-                            lresp.context_menu(|ui| {
-                                ui.set_min_width(175.0);
-                                ui.label(
-                                    egui::RichText::new(format!("Chop {}  @{:.2}s", chop_idx + 1, time_at))
-                                        .small().color(chop_color),
-                                );
-                                ui.separator();
-                                if ui.button("🎹  Piano Roll").clicked() {
-                                    *pr_ref.write() = Some((drum_idx, chop_idx));
-                                    ui.close_menu();
-                                }
-                                ui.separator();
-                                if ui.button(egui::RichText::new("🗑  Clear Steps").color(egui::Color32::from_rgb(200,80,80))).clicked() {
-                                    let mut tracks = self.drum_tracks.write();
-                                    if let Some(t) = tracks.get_mut(drum_idx) {
-                                        if let Some(row) = t.chop_steps.get_mut(chop_idx) {
-                                            *row = [false; NUM_STEPS];
-                                        }
-                                        if let Some(notes) = t.chop_piano_notes.get_mut(chop_idx) {
-                                            notes.clear();
-                                        }
-                                    }
-                                    ui.close_menu();
-                                }
-                            });
-                            // ──────────────────────────────────────────────────────────
                             ui.add_space(8.0);
-                                                    
-                            // Use seq_grid for main track, chop_steps for others
-                            let is_ons: [bool; NUM_STEPS] = {
-                                let tracks = self.drum_tracks.read();
-                                if Some(drum_idx) == main_idx {
-                                    let grid = self.seq_grid.read();
-                                    std::array::from_fn(|s| grid[s].contains(&chop_idx))
-                                } else {
-                                    tracks.get(drum_idx)
-                                        .and_then(|t| t.chop_steps.get(chop_idx))
-                                        .copied()
-                                        .unwrap_or([false; NUM_STEPS])
-                                }
-                            };
-                            draw_step_buttons(
-                                ui, step_w, row_h,
-                                chop_color, chop_color_dim,
-                                &is_ons, current_step, seq_playing,
+                            draw_step_buttons(ui, step_w, row_h, color, color_dim, &steps, current_step, seq_playing,
                                 &mut |step| {
-                                    let mut tracks = self.drum_tracks.write();
-                                    if let Some(t) = tracks.get_mut(drum_idx) {
-                                        if Some(drum_idx) == main_idx {
-                                            let mut grid = self.seq_grid.write();
-                                            let sp = &mut grid[step];
-                                            if let Some(i) = sp.iter().position(|&p| p == chop_idx) {
-                                                sp.remove(i);
-                                            } else {
-                                                sp.push(chop_idx);
-                                            }
-                                        } else if let Some(row) = t.chop_steps.get_mut(chop_idx) {
-                                            row[step] = !row[step];
-                                        }
-                                    }
-                                },
+                                    if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) { t.steps[step] = !t.steps[step]; }
+                                }
                             );
                         });
-                        
-                        // ADSR Knob row for EACH chop with enable checkbox
+
                         ui.horizontal(|ui| {
                             let (label_space, _) = ui.allocate_exact_size(egui::vec2(label_w, knob_h), egui::Sense::hover());
                             ui.painter().rect_filled(label_space, 0.0, egui::Color32::from_rgb(12, 12, 18));
                             ui.add_space(8.0);
-                            
-                            // ✅ Per-chop ADSR Enable Checkbox
                             let mut tracks = self.drum_tracks.write();
                             if let Some(t) = tracks.get_mut(drum_idx) {
-                                if let Some(enabled) = t.chop_adsr_enabled.get_mut(chop_idx) {
-                                    if ui.checkbox(enabled, "ADSR").changed() {
-                                        *self.status.write() = if *enabled {
-                                            format!("ADSR ON for Chop {}", chop_idx + 1)
-                                        } else {
-                                            format!("ADSR OFF for Chop {} (full volume)", chop_idx + 1)
-                                        };
-                                    }
+                                if ui.checkbox(&mut t.adsr_enabled, "ADSR").changed() {
+                                    *self.status.write() = if t.adsr_enabled {
+                                        format!("ADSR ON for {}", file_name)
+                                    } else {
+                                        format!("ADSR OFF for {} (full volume)", file_name)
+                                    };
                                 }
                             }
                             drop(tracks);
-
-                            // ✅ Per-chop Play Mode Toggle Buttons (ADD THIS)
-                                                        let play_mode = {
-                                let tracks = self.drum_tracks.read();
-                                tracks.get(drum_idx)
-                                    .and_then(|t| t.chop_play_modes.get(chop_idx).copied())
-                                    .unwrap_or(crate::gui::ChopPlayMode::ToNextChop)
-                            };
-
-                            // First 3 fixed modes
-                            let fixed_modes = [
-                                (crate::gui::ChopPlayMode::ToEnd,      "▶∞",  "Play to end of sample"),
-                                (crate::gui::ChopPlayMode::ToNextChop, "▶|",  "Play to next chop marker"),
-                                (crate::gui::ChopPlayMode::ToNextStep, "▶□",  "Play for one step then stop"),
-                            ];
-                            for (mode, label, tip) in fixed_modes {
-                                let active = play_mode == mode;
-                                let col = if active { chop_color } else { egui::Color32::from_gray(80) };
-                                let btn = egui::Button::new(egui::RichText::new(label).small().color(col))
-                                    .fill(if active {
-                                        egui::Color32::from_rgba_unmultiplied(
-                                            chop_color.r(), chop_color.g(), chop_color.b(), 35)
-                                    } else {
-                                        egui::Color32::TRANSPARENT
-                                    });
-                                if ui.add(btn).on_hover_text(tip).clicked() && !active {
-                                    let mut tracks = self.drum_tracks.write();
-                                    if let Some(t) = tracks.get_mut(drum_idx) {
-                                        if let Some(m) = t.chop_play_modes.get_mut(chop_idx) {
-                                            *m = mode;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // ── 4th mode: ToMarker — button + inline marker picker ──
-                            {
-                                // Collect all markers for this track (excluding the chop's own start)
-                                let all_marks = self.samples_manager.get_marks_for_sample(&file_name);
-
-                                let is_to_marker = matches!(play_mode, crate::gui::ChopPlayMode::ToMarker(_));
-                                let current_target_id: Option<usize> = if let crate::gui::ChopPlayMode::ToMarker(id) = play_mode {
-                                    Some(id)
-                                } else {
-                                    None
-                                };
-
-                                // The ▶M toggle button
-                                let col = if is_to_marker { chop_color } else { egui::Color32::from_gray(80) };
-                                let btn = egui::Button::new(egui::RichText::new("▶M").small().color(col))
-                                    .fill(if is_to_marker {
-                                        egui::Color32::from_rgba_unmultiplied(
-                                            chop_color.r(), chop_color.g(), chop_color.b(), 35)
-                                    } else {
-                                        egui::Color32::TRANSPARENT
-                                    });
-                                if ui.add(btn)
-                                    .on_hover_text("Play to a specific marker you choose")
-                                    .clicked()
-                                    && !is_to_marker
-                                {
-                                    // Activate with first available marker (that isn't this chop)
-                                    let own_pos = all_marks.get(chop_idx).map(|m| m.position).unwrap_or(0.0);
-                                    let first_other = all_marks.iter()
-                                        .find(|m| m.position > own_pos)
-                                        .map(|m| m.id)
-                                        .or_else(|| all_marks.first().map(|m| m.id));
-                                    if let Some(target_id) = first_other {
-                                        let mut tracks = self.drum_tracks.write();
-                                        if let Some(t) = tracks.get_mut(drum_idx) {
-                                            if let Some(m) = t.chop_play_modes.get_mut(chop_idx) {
-                                                *m = crate::gui::ChopPlayMode::ToMarker(target_id);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Inline marker ComboBox — only shown when ▶M is active
-                                if is_to_marker && !all_marks.is_empty() {
-                                    let dur_secs = {
-                                        let tracks = self.drum_tracks.read();
-                                        tracks.get(drum_idx)
-                                            .map(|t| t.asset.frames as f32 / t.asset.sample_rate as f32)
-                                            .unwrap_or(0.0)
-                                    };
-
-                                    // Label for currently selected target
-                                    let selected_label = current_target_id
-                                        .and_then(|id| all_marks.iter().find(|m| m.id == id))
-                                        .map(|m| format!("M{} {:.2}s", m.id, m.position * dur_secs))
-                                        .unwrap_or_else(|| "Pick marker".to_string());
-
-                                    let combo_id = egui::Id::new("to_marker_combo")
-                                        .with(drum_idx)
-                                        .with(chop_idx);
-
-                                    egui::ComboBox::from_id_source(combo_id)
-                                        .selected_text(
-                                            egui::RichText::new(&selected_label)
-                                                .small()
-                                                .color(chop_color)
-                                        )
-                                        .width(90.0)
-                                        .show_ui(ui, |ui| {
-                                            for mark in &all_marks {
-                                                let label = format!(
-                                                    "M{} @ {:.2}s",
-                                                    mark.id,
-                                                    mark.position * dur_secs
-                                                );
-                                                let is_selected = current_target_id == Some(mark.id);
-                                                if ui.selectable_label(is_selected, &label).clicked() {
-                                                    let mut tracks = self.drum_tracks.write();
-                                                    if let Some(t) = tracks.get_mut(drum_idx) {
-                                                        if let Some(m) = t.chop_play_modes.get_mut(chop_idx) {
-                                                            *m = crate::gui::ChopPlayMode::ToMarker(mark.id);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        });
-                                }
-                            }
-                            // ── end play mode buttons ─────────────────────────
-
-                            
                             let (knob_rect, _) = ui.allocate_exact_size(egui::vec2(steps_total, knob_h), egui::Sense::hover());
                             ui.painter().rect_filled(knob_rect, 2.0, egui::Color32::from_rgb(16, 16, 24));
                             ui.painter().rect_stroke(knob_rect, 2.0, egui::Stroke::new(0.5, egui::Color32::from_gray(30)));
-                            
-                            let adsr_now = {
-                                let tracks = self.drum_tracks.read();
-                                tracks.get(drum_idx)
-                                    .map(|t| t.chop_adsr.get(chop_idx).copied().unwrap_or(t.adsr))
-                                    .unwrap_or_default()
-                            };
-                            let base_id = egui::Id::new("drum_knob_chop").with(drum_idx).with(chop_idx);
-                            let painter = ui.painter().clone();
+                            let adsr_now = self.drum_tracks.read().get(drum_idx).map(|t| t.adsr).unwrap_or_default();
+                            let base_id  = egui::Id::new("drum_knob").with(drum_idx);
+                            let painter  = ui.painter().clone();
                             let (new_adsr, adsr_changed) = draw_adsr_knobs(ui, &painter, knob_rect, adsr_now, color, base_id);
                             if adsr_changed {
-                                let mut tracks = self.drum_tracks.write();
-                                if let Some(t) = tracks.get_mut(drum_idx) {
-                                    if let Some(adsr) = t.chop_adsr.get_mut(chop_idx) {
-                                        *adsr = new_adsr;
-                                    }
-                                    if chop_idx == 0 {
-                                        t.adsr = new_adsr;
-                                    }
-                                }
+                                if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) { t.adsr = new_adsr; }
                             }
                         });
                     }
+
+                    // Chop rows
+                    if has_chops {
+                        for (chop_idx, mark) in chop_marks.iter().enumerate() {
+                            let chop_color     = pad_color(chop_idx);
+                            let chop_color_dim = pad_color_dim(chop_idx);
+                            let dur_asset = {
+                                let tracks = self.drum_tracks.read();
+                                tracks.get(drum_idx).map(|t| t.asset.frames as f32 / t.asset.sample_rate as f32).unwrap_or(0.0)
+                            };
+                            let time_at = mark.position * dur_asset;
+
+                            ui.horizontal(|ui| {
+                                let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
+                                ui.painter().rect_filled(lr, 3.0, egui::Color32::from_rgb(17, 17, 25));
+                                ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(0.5, egui::Color32::from_gray(30)));
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_size(lr.min+egui::vec2(14.0,8.0), egui::vec2(3.0, row_h-16.0)),
+                                    1.0, chop_color,
+                                );
+                                let has_piano_notes = {
+                                    let tracks = self.drum_tracks.read();
+                                    tracks.get(drum_idx)
+                                        .and_then(|t| t.chop_piano_notes.get(chop_idx))
+                                        .map(|n| !n.is_empty())
+                                        .unwrap_or(false)
+                                };
+                                ui.painter().text(egui::pos2(lr.min.x+22.0, lr.center().y-4.0), egui::Align2::LEFT_CENTER,
+                                    format!("Chop {}{}", chop_idx + 1, if has_piano_notes { " 🎹" } else { "" }),
+                                    egui::FontId::proportional(10.0), chop_color);
+                                ui.painter().text(egui::pos2(lr.min.x+22.0, lr.center().y+5.0), egui::Align2::LEFT_CENTER,
+                                    format!("{:.2}s", time_at), egui::FontId::proportional(8.0), egui::Color32::from_gray(85));
+                                if lresp.clicked() {
+                                    *self.waveform_focus.write() = WaveformFocus::DrumTrack(drum_idx);
+                                }
+                                let pr_ref = self.piano_roll_chop.clone();
+                                lresp.context_menu(|ui| {
+                                    ui.set_min_width(175.0);
+                                    ui.label(egui::RichText::new(format!("Chop {}  @{:.2}s", chop_idx + 1, time_at)).small().color(chop_color));
+                                    ui.separator();
+                                    if ui.button("🎹  Piano Roll").clicked() {
+                                        *pr_ref.write() = Some((drum_idx, chop_idx));
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                    if ui.button(egui::RichText::new("🗑  Clear Steps").color(egui::Color32::from_rgb(200,80,80))).clicked() {
+                                        let mut tracks = self.drum_tracks.write();
+                                        if let Some(t) = tracks.get_mut(drum_idx) {
+                                            if let Some(row) = t.chop_steps.get_mut(chop_idx) { *row = [false; NUM_STEPS]; }
+                                            if let Some(notes) = t.chop_piano_notes.get_mut(chop_idx) { notes.clear(); }
+                                        }
+                                        ui.close_menu();
+                                    }
+                                });
+                                ui.add_space(8.0);
+                                let is_ons: [bool; NUM_STEPS] = {
+                                    let tracks = self.drum_tracks.read();
+                                    if Some(drum_idx) == main_idx {
+                                        let grid = self.seq_grid.read();
+                                        std::array::from_fn(|s| grid[s].contains(&chop_idx))
+                                    } else {
+                                        tracks.get(drum_idx)
+                                            .and_then(|t| t.chop_steps.get(chop_idx))
+                                            .copied()
+                                            .unwrap_or([false; NUM_STEPS])
+                                    }
+                                };
+                                draw_step_buttons(
+                                    ui, step_w, row_h, chop_color, chop_color_dim,
+                                    &is_ons, current_step, seq_playing,
+                                    &mut |step| {
+                                        let mut tracks = self.drum_tracks.write();
+                                        if let Some(t) = tracks.get_mut(drum_idx) {
+                                            if Some(drum_idx) == main_idx {
+                                                let mut grid = self.seq_grid.write();
+                                                let sp = &mut grid[step];
+                                                if let Some(i) = sp.iter().position(|&p| p == chop_idx) { sp.remove(i); }
+                                                else { sp.push(chop_idx); }
+                                            } else if let Some(row) = t.chop_steps.get_mut(chop_idx) {
+                                                row[step] = !row[step];
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+
+                            // Per-chop ADSR row
+                            ui.horizontal(|ui| {
+                                let (label_space, _) = ui.allocate_exact_size(egui::vec2(label_w, knob_h), egui::Sense::hover());
+                                ui.painter().rect_filled(label_space, 0.0, egui::Color32::from_rgb(12, 12, 18));
+                                ui.add_space(8.0);
+                                let mut tracks = self.drum_tracks.write();
+                                if let Some(t) = tracks.get_mut(drum_idx) {
+                                    if let Some(enabled) = t.chop_adsr_enabled.get_mut(chop_idx) {
+                                        if ui.checkbox(enabled, "ADSR").changed() {
+                                            *self.status.write() = if *enabled {
+                                                format!("ADSR ON for Chop {}", chop_idx + 1)
+                                            } else {
+                                                format!("ADSR OFF for Chop {} (full volume)", chop_idx + 1)
+                                            };
+                                        }
+                                    }
+                                }
+                                drop(tracks);
+
+                                let play_mode = {
+                                    let tracks = self.drum_tracks.read();
+                                    tracks.get(drum_idx)
+                                        .and_then(|t| t.chop_play_modes.get(chop_idx).copied())
+                                        .unwrap_or(crate::gui::ChopPlayMode::ToNextChop)
+                                };
+                                let fixed_modes = [
+                                    (crate::gui::ChopPlayMode::ToEnd,      "▶∞",  "Play to end of sample"),
+                                    (crate::gui::ChopPlayMode::ToNextChop, "▶|",  "Play to next chop marker"),
+                                    (crate::gui::ChopPlayMode::ToNextStep, "▶□",  "Play for one step then stop"),
+                                ];
+                                for (mode, label, tip) in fixed_modes {
+                                    let active = play_mode == mode;
+                                    let col = if active { chop_color } else { egui::Color32::from_gray(80) };
+                                    let btn = egui::Button::new(egui::RichText::new(label).small().color(col))
+                                        .fill(if active {
+                                            egui::Color32::from_rgba_unmultiplied(chop_color.r(), chop_color.g(), chop_color.b(), 35)
+                                        } else { egui::Color32::TRANSPARENT });
+                                    if ui.add(btn).on_hover_text(tip).clicked() && !active {
+                                        let mut tracks = self.drum_tracks.write();
+                                        if let Some(t) = tracks.get_mut(drum_idx) {
+                                            if let Some(m) = t.chop_play_modes.get_mut(chop_idx) { *m = mode; }
+                                        }
+                                    }
+                                }
+
+                                {
+                                    let all_marks = self.samples_manager.get_marks_for_sample(&file_name);
+                                    let is_to_marker = matches!(play_mode, crate::gui::ChopPlayMode::ToMarker(_));
+                                    let current_target_id: Option<usize> = if let crate::gui::ChopPlayMode::ToMarker(id) = play_mode { Some(id) } else { None };
+                                    let col = if is_to_marker { chop_color } else { egui::Color32::from_gray(80) };
+                                    let btn = egui::Button::new(egui::RichText::new("▶M").small().color(col))
+                                        .fill(if is_to_marker {
+                                            egui::Color32::from_rgba_unmultiplied(chop_color.r(), chop_color.g(), chop_color.b(), 35)
+                                        } else { egui::Color32::TRANSPARENT });
+                                    if ui.add(btn).on_hover_text("Play to a specific marker you choose").clicked() && !is_to_marker {
+                                        let own_pos = all_marks.get(chop_idx).map(|m| m.position).unwrap_or(0.0);
+                                        let first_other = all_marks.iter().find(|m| m.position > own_pos).map(|m| m.id)
+                                            .or_else(|| all_marks.first().map(|m| m.id));
+                                        if let Some(target_id) = first_other {
+                                            let mut tracks = self.drum_tracks.write();
+                                            if let Some(t) = tracks.get_mut(drum_idx) {
+                                                if let Some(m) = t.chop_play_modes.get_mut(chop_idx) {
+                                                    *m = crate::gui::ChopPlayMode::ToMarker(target_id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if is_to_marker && !all_marks.is_empty() {
+                                        let dur_secs = {
+                                            let tracks = self.drum_tracks.read();
+                                            tracks.get(drum_idx).map(|t| t.asset.frames as f32 / t.asset.sample_rate as f32).unwrap_or(0.0)
+                                        };
+                                        let selected_label = current_target_id
+                                            .and_then(|id| all_marks.iter().find(|m| m.id == id))
+                                            .map(|m| format!("M{} {:.2}s", m.id, m.position * dur_secs))
+                                            .unwrap_or_else(|| "Pick marker".to_string());
+                                        let combo_id = egui::Id::new("to_marker_combo").with(drum_idx).with(chop_idx);
+                                        egui::ComboBox::from_id_source(combo_id)
+                                            .selected_text(egui::RichText::new(&selected_label).small().color(chop_color))
+                                            .width(90.0)
+                                            .show_ui(ui, |ui| {
+                                                for mark in &all_marks {
+                                                    let label = format!("M{} @ {:.2}s", mark.id, mark.position * dur_secs);
+                                                    let is_selected = current_target_id == Some(mark.id);
+                                                    if ui.selectable_label(is_selected, &label).clicked() {
+                                                        let mut tracks = self.drum_tracks.write();
+                                                        if let Some(t) = tracks.get_mut(drum_idx) {
+                                                            if let Some(m) = t.chop_play_modes.get_mut(chop_idx) {
+                                                                *m = crate::gui::ChopPlayMode::ToMarker(mark.id);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                    }
+                                }
+
+                                let (knob_rect, _) = ui.allocate_exact_size(egui::vec2(steps_total, knob_h), egui::Sense::hover());
+                                ui.painter().rect_filled(knob_rect, 2.0, egui::Color32::from_rgb(16, 16, 24));
+                                ui.painter().rect_stroke(knob_rect, 2.0, egui::Stroke::new(0.5, egui::Color32::from_gray(30)));
+                                let adsr_now = {
+                                    let tracks = self.drum_tracks.read();
+                                    tracks.get(drum_idx).map(|t| t.chop_adsr.get(chop_idx).copied().unwrap_or(t.adsr)).unwrap_or_default()
+                                };
+                                let base_id = egui::Id::new("drum_knob_chop").with(drum_idx).with(chop_idx);
+                                let painter = ui.painter().clone();
+                                let (new_adsr, adsr_changed) = draw_adsr_knobs(ui, &painter, knob_rect, adsr_now, color, base_id);
+                                if adsr_changed {
+                                    let mut tracks = self.drum_tracks.write();
+                                    if let Some(t) = tracks.get_mut(drum_idx) {
+                                        if let Some(adsr) = t.chop_adsr.get_mut(chop_idx) { *adsr = new_adsr; }
+                                        if chop_idx == 0 { t.adsr = new_adsr; }
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    ui.add_space(2.0);
+                } // for drum_idx
+
+                // Recording tracks
+                self.draw_recording_tracks(ui, current_step, seq_playing, step_w, row_h, label_w);
+
+                if n_drums == 0 && self.rec_tracks.read().is_empty() {
+                    ui.label(egui::RichText::new(
+                        "No tracks yet — click ＋ Add Track to load a sample")
+                        .small().color(egui::Color32::from_gray(80)).italics());
                 }
-                
-                ui.add_space(2.0);
-            }
-            
-            if n_drums == 0 {
+                ui.add_space(3.0);
                 ui.label(egui::RichText::new(
-                    "No tracks yet — click ＋ Add Track to load a sample")
-                    .small().color(egui::Color32::from_gray(80)).italics());
-            }
-            ui.add_space(3.0);
-            ui.label(egui::RichText::new(
-                "Click steps to toggle  ·  Click label to focus/preview  ·  Right-click for options  ·  Drag knobs to shape ADSR")
-                .small().color(egui::Color32::from_gray(58)));
-        });
+                    "Click steps to toggle  ·  Click label to focus/preview  ·  Right-click for options  ·  Drag knobs to shape ADSR")
+                    .small().color(egui::Color32::from_gray(58)));
+
+                }); // end ScrollArea
+        }); // end frame
+    }
+
+    pub fn draw_recording_tracks(
+        &mut self,
+        ui:           &mut egui::Ui,
+        current_step: usize,
+        seq_playing:  bool,
+        step_w:       f32,
+        row_h:        f32,
+        label_w:      f32,
+    ) {
+        let n_rec = self.rec_tracks.read().len();
+        if n_rec == 0 { return; }
+
+        let ctrl_w   = 120.0_f32;
+        let knob_h   = 30.0_f32;
+        let rec_base = egui::Color32::from_rgb(220, 70, 60);
+        let rec_dim  = egui::Color32::from_rgb(44, 14, 12);
+
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("  🎙 Recording Tracks").small().color(egui::Color32::from_gray(70)));
+
+        let active_rec_track = *self.rec_active_track.read();
+
+        for rec_idx in 0..n_rec {
+            let (state, short_name, has_asset, steps, muted, dur_str, take_num) = {
+                let tracks = self.rec_tracks.read();
+                let t = &tracks[rec_idx];
+                let dur = t.duration_secs().map(|s| format!("{:.2}s", s)).unwrap_or_else(|| "–".to_string());
+                (t.state.clone(), t.short_name(), t.asset.is_some(), t.steps, t.muted, dur, t.take_number)
+            };
+
+            let is_active = active_rec_track == Some(rec_idx);
+            let peak      = if is_active { self.rec_manager.peak() } else { 0.0 };
+            let rec_secs  = if is_active { self.rec_manager.recorded_secs() } else { 0.0 };
+
+            // Row A: label + steps
+            ui.horizontal(|ui| {
+                let (lr, lresp) = ui.allocate_exact_size(egui::vec2(label_w, row_h), egui::Sense::click());
+                let border_col = if is_active { egui::Color32::from_rgb(255, 60, 60) }
+                                 else if has_asset { egui::Color32::from_rgb(160, 55, 45) }
+                                 else { egui::Color32::from_gray(42) };
+                ui.painter().rect_filled(lr, 3.0, egui::Color32::from_rgb(22, 13, 13));
+                ui.painter().rect_stroke(lr, 3.0, egui::Stroke::new(if is_active { 2.0 } else { 1.0 }, border_col));
+                let bar_col = if is_active { egui::Color32::from_rgb(255, 60, 60) }
+                              else if has_asset { rec_base } else { egui::Color32::from_gray(50) };
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(lr.min + egui::vec2(5.0, 7.0), egui::vec2(4.0, lr.height() - 14.0)),
+                    2.0, bar_col,
+                );
+                if is_active {
+                    ui.painter().circle_filled(egui::pos2(lr.max.x - 9.0, lr.min.y + 9.0), 4.5, egui::Color32::from_rgb(255, 50, 50));
+                }
+                ui.painter().text(
+                    egui::pos2(lr.min.x + 14.0, lr.center().y - 5.0), egui::Align2::LEFT_CENTER,
+                    &short_name, egui::FontId::proportional(10.5),
+                    if muted { egui::Color32::from_gray(70) } else { rec_base },
+                );
+                let sub = match &state {
+                    RecordState::Idle      => "idle".to_string(),
+                    RecordState::Recording => format!("● {:.1}s", rec_secs),
+                    RecordState::Recorded  => dur_str.clone(),
+                };
+                let sub_col = match state {
+                    RecordState::Recording => egui::Color32::from_rgb(255, 90, 90),
+                    RecordState::Recorded  => egui::Color32::from_rgb(90, 200, 100),
+                    _                      => egui::Color32::from_gray(65),
+                };
+                ui.painter().text(
+                    egui::pos2(lr.min.x + 14.0, lr.center().y + 6.0), egui::Align2::LEFT_CENTER,
+                    sub, egui::FontId::proportional(8.5), sub_col,
+                );
+                if is_active && peak > 0.0 {
+                    let mr = egui::Rect::from_min_size(egui::pos2(lr.min.x + 5.0, lr.max.y - 5.0), egui::vec2(lr.width() - 10.0, 3.0));
+                    ui.painter().rect_filled(mr, 1.0, egui::Color32::from_gray(20));
+                    let fill = (peak * mr.width()).min(mr.width());
+                    let mc = if peak > 0.85 { egui::Color32::from_rgb(255, 50, 40) }
+                             else if peak > 0.5 { egui::Color32::from_rgb(255, 200, 40) }
+                             else { egui::Color32::from_rgb(50, 220, 80) };
+                    ui.painter().rect_filled(egui::Rect::from_min_size(mr.min, egui::vec2(fill, 3.0)), 1.0, mc);
+                }
+                let rct = self.rec_tracks.clone();
+                lresp.context_menu(|ui| {
+                    ui.set_min_width(160.0);
+                    ui.label(egui::RichText::new(&short_name).small().color(rec_base));
+                    ui.separator();
+                    if ui.button(if muted { "🔊 Unmute" } else { "🔇 Mute" }).clicked() {
+                        if let Some(t) = rct.write().get_mut(rec_idx) { t.muted = !t.muted; }
+                        ui.close_menu();
+                    }
+                    if ui.button("🗑 Clear Steps").clicked() {
+                        if let Some(t) = rct.write().get_mut(rec_idx) { t.steps = [false; NUM_STEPS]; }
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button(egui::RichText::new("✕ Remove Track").color(egui::Color32::from_rgb(220,80,60))).clicked() {
+                        rct.write().remove(rec_idx);
+                        ui.close_menu();
+                    }
+                });
+                ui.add_space(8.0);
+                if has_asset {
+                    draw_step_buttons(ui, step_w, row_h, rec_base, rec_dim, &steps, current_step, seq_playing,
+                        &mut |step| {
+                            if let Some(t) = self.rec_tracks.write().get_mut(rec_idx) { t.steps[step] = !t.steps[step]; }
+                        },
+                    );
+                } else {
+                    let total_w = step_w * NUM_STEPS as f32;
+                    let (ph, _) = ui.allocate_exact_size(egui::vec2(total_w, row_h), egui::Sense::hover());
+                    ui.painter().rect_filled(ph, 2.0, egui::Color32::from_rgb(17, 11, 11));
+                    ui.painter().text(ph.center(), egui::Align2::CENTER_CENTER,
+                        if is_active { "Recording…  stop to enable steps" }
+                        else         { "Select a device and press 🔴 Rec to record" },
+                        egui::FontId::proportional(9.0), egui::Color32::from_gray(52));
+                }
+            });
+
+            // Row B: device + rec/stop + promote
+            ui.horizontal(|ui| {
+                let (ls, _) = ui.allocate_exact_size(egui::vec2(label_w, knob_h), egui::Sense::hover());
+                ui.painter().rect_filled(ls, 0.0, egui::Color32::from_rgb(14, 9, 9));
+                ui.add_space(8.0);
+
+                let devices = self.input_devices.read().clone();
+                let current_label = {
+                    let tracks = self.rec_tracks.read();
+                    tracks.get(rec_idx).and_then(|t| t.device_label.clone()).unwrap_or_else(|| "Pick input…".to_string())
+                };
+                let short_lbl = {
+                    let s = current_label.split(": ").nth(1).unwrap_or(&current_label);
+                    if s.len() > 16 { format!("{}…", &s[..14]) } else { s.to_string() }
+                };
+                egui::ComboBox::from_id_source(egui::Id::new("rec_dev").with(rec_idx))
+                    .selected_text(egui::RichText::new(&short_lbl).small())
+                    .width(ctrl_w)
+                    .show_ui(ui, |ui| {
+                        let mut last_host = String::new();
+                        for dev in &devices {
+                            if dev.host_name != last_host {
+                                ui.separator();
+                                ui.label(egui::RichText::new(&dev.host_name).small().color(egui::Color32::from_gray(130)));
+                                last_host = dev.host_name.clone();
+                            }
+                            let sel = current_label == dev.label;
+                            let short = if dev.device_name.len() > 30 { format!("{}…", &dev.device_name[..28]) } else { dev.device_name.clone() };
+                            if ui.selectable_label(sel, egui::RichText::new(&short).small()).clicked() {
+                                if let Some(t) = self.rec_tracks.write().get_mut(rec_idx) { t.device_label = Some(dev.label.clone()); }
+                            }
+                        }
+                        ui.separator();
+                        if ui.button(egui::RichText::new("↻ Refresh devices").small()).clicked() { self.refresh_input_devices(); }
+                    });
+
+                ui.add_space(6.0);
+
+                if is_active {
+                    if ui.add(egui::Button::new(egui::RichText::new("⏹ Stop").small().color(egui::Color32::from_rgb(255, 120, 80)))).clicked() {
+                        self.stop_recording(rec_idx);
+                    }
+                } else {
+                    let can_rec = { let tracks = self.rec_tracks.read(); tracks.get(rec_idx).and_then(|t| t.device_label.as_ref()).is_some() };
+                    let already_busy = self.rec_manager.is_recording();
+                    if ui.add_enabled(can_rec && !already_busy, egui::Button::new(
+                        egui::RichText::new("🔴 Rec").small().color(
+                            if can_rec && !already_busy { egui::Color32::from_rgb(255, 60, 60) } else { egui::Color32::from_gray(65) }
+                        )
+                    )).on_hover_text(if already_busy { "Stop the current recording first" }
+                       else if !can_rec { "Select an input device first" }
+                       else { "Record from selected input" }).clicked() {
+                        self.start_recording(rec_idx);
+                    }
+                }
+
+                if has_asset {
+                    ui.add_space(4.0);
+                    if ui.add(egui::Button::new(egui::RichText::new("→ Drum Track").small().color(egui::Color32::from_rgb(80, 200, 130))))
+                        .on_hover_text("Promote this recording to a full drum track").clicked() {
+                        self.promote_rec_to_drum(rec_idx);
+                        return;
+                    }
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(format!("take {} · {}", take_num - 1, dur_str)).small().color(egui::Color32::from_gray(75)));
+                }
+            });
+
+            ui.add_space(2.0);
+        }
     }
 
     pub fn draw_piano_roll(&mut self, ctx: &egui::Context) {
