@@ -183,7 +183,7 @@ impl eframe::App for AppState {
                                 let tracks = self.drum_tracks.read();
                                 tracks.get(*drum_idx).map(|t| (t.asset.file_name.clone(), t.sample_uuid))
                             };
-                            if let Some((file_name, sample_uuid)) = track_info {
+                            if let Some((_file_name, sample_uuid)) = track_info {
                                 // ✅ All mark operations use UUID — never bleeds across same-name tracks
                                 let marks = self.samples_manager.get_marks_for_sample(&sample_uuid);
 
@@ -377,7 +377,7 @@ impl eframe::App for AppState {
                         let tracks = self.drum_tracks.read();
                         tracks.get(*drum_idx).map(|t| (t.asset.file_name.clone(), t.sample_uuid))
                     };
-                    if let Some((file_name, sample_uuid)) = track_info {
+                    if let Some((_file_name, sample_uuid)) = track_info {
                         let marks = self.samples_manager.get_marks_for_sample(&sample_uuid);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Regions").small().color(egui::Color32::from_gray(100)));
@@ -415,10 +415,19 @@ impl eframe::App for AppState {
                         });
                     }
                 }
+                ui.add_space(8.0);
 
                 // ── Step Sequencer ────────────────────────────────────
                 ui.add_space(8.0);
                 self.draw_step_sequencer(ui);
+
+                // ── Song Editor (collapsible, toggled by 📋 Song ▼ button) ─
+                ui.add_space(4.0);
+                self.draw_song_editor(ui);
+
+                // ── FL Playlist (collapsible, toggled by 🎛 Playlist ▼ button) ─
+                ui.add_space(4.0);
+                self.draw_fl_playlist(ui);
 
                 // ── M key — mark chop point ──────────────────────────
                 if self.is_playing.load(Ordering::Relaxed) {

@@ -8,46 +8,105 @@ use crate::recording::RecordState;
 
 impl AppState {
     pub fn seq_header_ui(&mut self, ui: &mut egui::Ui) {
+        // ── Row 1 – Pattern tabs ───────────────────────────────────────────
+        ui.horizontal(|ui| {
+            self.draw_pattern_tabs(ui);     // defined in pattern_playlist.rs
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // ── FL Playlist toggle ────────────────────────────────────
+                let pl_open = self.playlist_view_open.load(std::sync::atomic::Ordering::Relaxed);
+                let (pl_lbl, pl_col) = if pl_open {
+                    ("🎛 Playlist ▲", egui::Color32::from_rgb(237, 164, 80))
+                } else {
+                    ("🎛 Playlist ▼", egui::Color32::from_gray(130))
+                };
+                if ui.add(egui::Button::new(egui::RichText::new(pl_lbl).small().color(pl_col))
+                    .fill(if pl_open {
+                        egui::Color32::from_rgba_unmultiplied(180, 120, 30, 35)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                ).on_hover_text("Toggle FL Playlist – drag blocks to freely arrange patterns").clicked() {
+                    self.playlist_view_open.store(!pl_open, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // ── Song Editor toggle ────────────────────────────────────
+                let open      = self.song_editor_open.load(std::sync::atomic::Ordering::Relaxed);
+                let (lbl, col) = if open {
+                    ("📋 Song ▲", egui::Color32::from_rgb(100, 149, 237))
+                } else {
+                    ("📋 Song ▼", egui::Color32::from_gray(130))
+                };
+                if ui.add(egui::Button::new(egui::RichText::new(lbl).small().color(col))
+                    .fill(if open {
+                        egui::Color32::from_rgba_unmultiplied(80, 120, 210, 35)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                ).on_hover_text("Toggle Song Editor – arrange patterns on a timeline").clicked() {
+                    self.song_editor_open.store(!open, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        });
+
+        ui.add(egui::Separator::default().horizontal().spacing(3.0));
+
+        // ── Row 2 – Transport / Add Track (original seq header content) ───
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("STEP SEQUENCER").small().strong().color(egui::Color32::from_gray(100)));
             ui.separator();
-            let mut bpm = self.seq_bpm.load(Ordering::Relaxed);
+
+            let mut bpm = self.seq_bpm.load(std::sync::atomic::Ordering::Relaxed);
             ui.label(egui::RichText::new("BPM").small().color(egui::Color32::from_gray(120)));
             if ui.add(egui::DragValue::new(&mut bpm).speed(0.5).clamp_range(40.0..=300.0).fixed_decimals(0)).changed() {
-                self.seq_bpm.store(bpm, Ordering::Relaxed);
+                self.seq_bpm.store(bpm, std::sync::atomic::Ordering::Relaxed);
             }
             ui.separator();
-            let playing = self.seq_playing.load(Ordering::Relaxed);
-            let (lbl, col) = if playing { ("⏹ Stop", egui::Color32::from_rgb(220,80,60)) } else { ("▶ Play", egui::Color32::from_rgb(60,200,100)) };
+
+            let playing = self.seq_playing.load(std::sync::atomic::Ordering::Relaxed);
+            let (lbl, col) = if playing {
+                ("⏹ Stop", egui::Color32::from_rgb(220, 80, 60))
+            } else {
+                ("▶ Play", egui::Color32::from_rgb(60, 200, 100))
+            };
             if ui.add(egui::Button::new(egui::RichText::new(lbl).color(col).small())).clicked() {
                 if playing { self.stop_sequencer(); } else { self.start_sequencer(); }
             }
-            if ui.add(egui::Button::new(egui::RichText::new("🗑 Clear").small().color(egui::Color32::from_gray(120)))).clicked() {
+
+            if ui.add(egui::Button::new(
+                egui::RichText::new("🗑 Clear").small().color(egui::Color32::from_gray(120))
+            )).clicked() {
                 let mut g = self.seq_grid.write();
                 for s in g.iter_mut() { s.clear(); }
                 let mut tracks = self.drum_tracks.write();
                 for t in tracks.iter_mut() {
-                    t.steps = [false; NUM_STEPS];
-                    for row in t.chop_steps.iter_mut() { *row = [false; NUM_STEPS]; }
+                    t.steps = [false; crate::gui::NUM_STEPS];
+                    for row in t.chop_steps.iter_mut() { *row = [false; crate::gui::NUM_STEPS]; }
                 }
             }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new(egui::RichText::new("🎹 Piano Roll").small().color(egui::Color32::from_rgb(140,180,255)))).clicked() {
-                    *self.piano_roll_open.write() = true;
+                // ← Add Track is now the leftmost button in the right group
+                //   so it's right next to the Song Editor toggle above.
+                if ui.add(egui::Button::new(
+                    egui::RichText::new("＋ Add Track").small().color(egui::Color32::from_rgb(80,220,140))
+                )).clicked() {
+                    self.load_drum_track();
                 }
                 if ui.add(egui::Button::new(
-                    egui::RichText::new("🎙 Rec Track")
-                        .small()
-                        .color(egui::Color32::from_rgb(220, 80, 80))
-                )).on_hover_text("Add a recording track (capture from any input device)").clicked() {
+                    egui::RichText::new("🎙 Rec Track").small().color(egui::Color32::from_rgb(220, 80, 80))
+                )).on_hover_text("Add a recording track").clicked() {
                     self.add_rec_track();
                 }
-                if ui.add(egui::Button::new(egui::RichText::new("＋ Add Track").small().color(egui::Color32::from_rgb(80,220,140)))).clicked() {
-                    self.load_drum_track();
+                if ui.add(egui::Button::new(
+                    egui::RichText::new("🎹 Piano Roll").small().color(egui::Color32::from_rgb(140,180,255))
+                )).clicked() {
+                    *self.piano_roll_open.write() = true;
                 }
             });
         });
     }
+
 
     pub fn draw_step_sequencer(&mut self, ui: &mut egui::Ui) {
         let label_w     = 130.0;

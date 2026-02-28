@@ -249,4 +249,15 @@ impl SamplesManager {
             mark.position = new_position.clamp(0.0, 1.0);
         }
     }
+    pub fn clear_marks_for_uuid(&self, sample_uuid: &uuid::Uuid) {
+        self.marks.write().retain(|m| &m.sample_uuid != sample_uuid);
+        // Also remove any regions that referenced marks under this UUID
+        // (regions will be re-created from snapshots when the pattern reloads)
+        let dead_mark_ids: Vec<usize> = {
+            // collect IDs of marks we just deleted (we can't anymore, they're gone)
+            // Instead remove regions whose sample_uuid matches
+            vec![]
+        };
+        self.regions.write().retain(|r| &r.sample_uuid != sample_uuid);
+    }
 }
