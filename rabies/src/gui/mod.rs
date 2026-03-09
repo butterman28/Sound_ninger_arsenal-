@@ -637,12 +637,12 @@ impl AppState {
 //  Sequencer tick
 // ═══════════════════════════════════════════════════════════════════════════════
 impl AppState {
-    pub fn tick_sequencer(&self) {
-        if self.song_editor.is_playing() && self.seq_playing.load(Ordering::Relaxed) {
+    pub fn tick_sequencer(&self) {  
+    if self.song_editor.is_playing.load(Ordering::Relaxed) && self.seq_playing.load(Ordering::Relaxed) {
             let bar     = self.song_editor.current_bar.load(Ordering::Relaxed);
             let arr     = self.song_editor.get_arrangement_snapshot();
-            let first   = arr.iter().enumerate()
-                .find(|(_, row)| row.get(bar).copied().unwrap_or(false))
+            let first = arr.iter().enumerate()
+                .find(|(_, row)| row.get(bar).copied().flatten().is_some())
                 .map(|(i, _)| i);
             if let Some(new_idx) = first {
                 let active = self.song_editor.active_edit_idx();
@@ -672,10 +672,10 @@ impl AppState {
             cur
         };
 
-        if self.song_editor.is_playing() {
-            self.song_editor.advance_song();
+        
+        if self.song_editor.is_playing.load(Ordering::Relaxed) {
+            let _ = self.song_editor.advance_song();
         }
-
         let mut voices: Vec<Voice> = Vec::new();
 
         if let Some(asset) = self.current_asset.read().clone() {

@@ -20,7 +20,7 @@ impl AppState {
                 } else {
                     ("🎛 Playlist ▼", egui::Color32::from_gray(130))
                 };
-                if ui.add(egui::Button::new(egui::RichText::new(pl_lbl).small().color(pl_col))
+                if ui.add(egui::Button::new(egui::RichText::new(pl_lbl).size(20.0).color(pl_col))
                     .fill(if pl_open {
                         egui::Color32::from_rgba_unmultiplied(180, 120, 30, 35)
                     } else {
@@ -37,7 +37,7 @@ impl AppState {
                 } else {
                     ("📋 Song ▼", egui::Color32::from_gray(130))
                 };
-                if ui.add(egui::Button::new(egui::RichText::new(lbl).small().color(col))
+                if ui.add(egui::Button::new(egui::RichText::new(lbl).size(20.0).color(col))
                     .fill(if open {
                         egui::Color32::from_rgba_unmultiplied(80, 120, 210, 35)
                     } else {
@@ -53,11 +53,11 @@ impl AppState {
 
         // ── Row 2 – Transport / Add Track (original seq header content) ───
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("STEP SEQUENCER").small().strong().color(egui::Color32::from_gray(100)));
+            ui.label(egui::RichText::new("STEP SEQUENCER").size(20.0).strong().color(egui::Color32::from_gray(100)));
             ui.separator();
 
             let mut bpm = self.seq_bpm.load(std::sync::atomic::Ordering::Relaxed);
-            ui.label(egui::RichText::new("BPM").small().color(egui::Color32::from_gray(120)));
+            ui.label(egui::RichText::new("BPM").size(20.0).color(egui::Color32::from_gray(120)));
             if ui.add(egui::DragValue::new(&mut bpm).speed(0.5).clamp_range(40.0..=300.0).fixed_decimals(0)).changed() {
                 self.seq_bpm.store(bpm, std::sync::atomic::Ordering::Relaxed);
             }
@@ -69,12 +69,12 @@ impl AppState {
             } else {
                 ("▶ Play", egui::Color32::from_rgb(60, 200, 100))
             };
-            if ui.add(egui::Button::new(egui::RichText::new(lbl).color(col).small())).clicked() {
+            if ui.add(egui::Button::new(egui::RichText::new(lbl).color(col).size(20.0))).clicked() {
                 if playing { self.stop_sequencer(); } else { self.start_sequencer(); }
             }
 
             if ui.add(egui::Button::new(
-                egui::RichText::new("🗑 Clear").small().color(egui::Color32::from_gray(120))
+                egui::RichText::new("🗑 Clear").size(20.0).color(egui::Color32::from_gray(120))
             )).clicked() {
                 let mut g = self.seq_grid.write();
                 for s in g.iter_mut() { s.clear(); }
@@ -89,17 +89,17 @@ impl AppState {
                 // ← Add Track is now the leftmost button in the right group
                 //   so it's right next to the Song Editor toggle above.
                 if ui.add(egui::Button::new(
-                    egui::RichText::new("＋ Add Track").small().color(egui::Color32::from_rgb(80,220,140))
+                    egui::RichText::new("＋ Add Track").size(20.0).color(egui::Color32::from_rgb(80,220,140))
                 )).clicked() {
                     self.load_drum_track();
                 }
                 if ui.add(egui::Button::new(
-                    egui::RichText::new("🎙 Rec Track").small().color(egui::Color32::from_rgb(220, 80, 80))
+                    egui::RichText::new("🎙 Rec Track").size(20.0).color(egui::Color32::from_rgb(220, 80, 80))
                 )).on_hover_text("Add a recording track").clicked() {
                     self.add_rec_track();
                 }
                 if ui.add(egui::Button::new(
-                    egui::RichText::new("🎹 Piano Roll").small().color(egui::Color32::from_rgb(140,180,255))
+                    egui::RichText::new("🎹 Piano Roll").size(20.0).color(egui::Color32::from_rgb(140,180,255))
                 )).clicked() {
                     *self.piano_roll_open.write() = true;
                 }
@@ -154,7 +154,7 @@ impl AppState {
                 let main_idx = *self.main_track_index.read();
                 if n_drums > 0 {
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new("  Tracks").small().color(egui::Color32::from_gray(70)));
+                    ui.label(egui::RichText::new("  Tracks").size(20.0).color(egui::Color32::from_gray(70)));
                 }
 
                 for drum_idx in 0..n_drums {
@@ -290,7 +290,7 @@ impl AppState {
                                 let pr_ref = self.piano_roll_chop.clone();
                                 lresp.context_menu(|ui| {
                                     ui.set_min_width(175.0);
-                                    ui.label(egui::RichText::new(format!("Chop {}  @{:.2}s", chop_idx + 1, time_at)).small().color(chop_color));
+                                    ui.label(egui::RichText::new(format!("Chop {}  @{:.2}s", chop_idx + 1, time_at)).size(20.0).color(chop_color));
                                     ui.separator();
                                     if ui.button("🎹  Piano Roll").clicked() {
                                         *pr_ref.write() = Some((drum_idx, chop_idx));
@@ -371,7 +371,7 @@ impl AppState {
                                 for (mode, label, tip) in fixed_modes {
                                     let active = play_mode == mode;
                                     let col = if active { chop_color } else { egui::Color32::from_gray(80) };
-                                    let btn = egui::Button::new(egui::RichText::new(label).small().color(col))
+                                    let btn = egui::Button::new(egui::RichText::new(label).size(20.0).color(col))
                                         .fill(if active {
                                             egui::Color32::from_rgba_unmultiplied(chop_color.r(), chop_color.g(), chop_color.b(), 35)
                                         } else { egui::Color32::TRANSPARENT });
@@ -389,7 +389,7 @@ impl AppState {
                                     let is_to_marker = matches!(play_mode, crate::gui::ChopPlayMode::ToMarker(_));
                                     let current_target_id: Option<usize> = if let crate::gui::ChopPlayMode::ToMarker(id) = play_mode { Some(id) } else { None };
                                     let col = if is_to_marker { chop_color } else { egui::Color32::from_gray(80) };
-                                    let btn = egui::Button::new(egui::RichText::new("▶M").small().color(col))
+                                    let btn = egui::Button::new(egui::RichText::new("▶M").size(20.0).color(col))
                                         .fill(if is_to_marker {
                                             egui::Color32::from_rgba_unmultiplied(chop_color.r(), chop_color.g(), chop_color.b(), 35)
                                         } else { egui::Color32::TRANSPARENT });
@@ -417,7 +417,7 @@ impl AppState {
                                             .unwrap_or_else(|| "Pick marker".to_string());
                                         let combo_id = egui::Id::new("to_marker_combo").with(drum_idx).with(chop_idx);
                                         egui::ComboBox::from_id_source(combo_id)
-                                            .selected_text(egui::RichText::new(&selected_label).small().color(chop_color))
+                                            .selected_text(egui::RichText::new(&selected_label).size(20.0).color(chop_color))
                                             .width(90.0)
                                             .show_ui(ui, |ui| {
                                                 for mark in &all_marks {
@@ -465,12 +465,12 @@ impl AppState {
                 if n_drums == 0 && self.rec_tracks.read().is_empty() {
                     ui.label(egui::RichText::new(
                         "No tracks yet — click ＋ Add Track to load a sample")
-                        .small().color(egui::Color32::from_gray(80)).italics());
+                        .size(20.0).color(egui::Color32::from_gray(80)).italics());
                 }
                 ui.add_space(3.0);
                 ui.label(egui::RichText::new(
                     "Click steps to toggle  ·  Click label to focus/preview  ·  Right-click for options  ·  Drag knobs to shape ADSR")
-                    .small().color(egui::Color32::from_gray(58)));
+                    .size(20.0).color(egui::Color32::from_gray(58)));
 
                 });
         });
@@ -494,7 +494,7 @@ impl AppState {
         let rec_dim  = egui::Color32::from_rgb(44, 14, 12);
 
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("  🎙 Recording Tracks").small().color(egui::Color32::from_gray(70)));
+        ui.label(egui::RichText::new("  🎙 Recording Tracks").size(20.0).color(egui::Color32::from_gray(70)));
 
         let active_rec_track = *self.rec_active_track.read();
 
@@ -557,7 +557,7 @@ impl AppState {
                 let rct = self.rec_tracks.clone();
                 lresp.context_menu(|ui| {
                     ui.set_min_width(160.0);
-                    ui.label(egui::RichText::new(&short_name).small().color(rec_base));
+                    ui.label(egui::RichText::new(&short_name).size(20.0).color(rec_base));
                     ui.separator();
                     if ui.button(if muted { "🔊 Unmute" } else { "🔇 Mute" }).clicked() {
                         if let Some(t) = rct.write().get_mut(rec_idx) { t.muted = !t.muted; }
@@ -606,37 +606,37 @@ impl AppState {
                     if s.len() > 16 { format!("{}…", &s[..14]) } else { s.to_string() }
                 };
                 egui::ComboBox::from_id_source(egui::Id::new("rec_dev").with(rec_idx))
-                    .selected_text(egui::RichText::new(&short_lbl).small())
+                    .selected_text(egui::RichText::new(&short_lbl).size(20.0))
                     .width(ctrl_w)
                     .show_ui(ui, |ui| {
                         let mut last_host = String::new();
                         for dev in &devices {
                             if dev.host_name != last_host {
                                 ui.separator();
-                                ui.label(egui::RichText::new(&dev.host_name).small().color(egui::Color32::from_gray(130)));
+                                ui.label(egui::RichText::new(&dev.host_name).size(20.0).color(egui::Color32::from_gray(130)));
                                 last_host = dev.host_name.clone();
                             }
                             let sel = current_label == dev.label;
                             let short = if dev.device_name.len() > 30 { format!("{}…", &dev.device_name[..28]) } else { dev.device_name.clone() };
-                            if ui.selectable_label(sel, egui::RichText::new(&short).small()).clicked() {
+                            if ui.selectable_label(sel, egui::RichText::new(&short).size(20.0)).clicked() {
                                 if let Some(t) = self.rec_tracks.write().get_mut(rec_idx) { t.device_label = Some(dev.label.clone()); }
                             }
                         }
                         ui.separator();
-                        if ui.button(egui::RichText::new("↻ Refresh devices").small()).clicked() { self.refresh_input_devices(); }
+                        if ui.button(egui::RichText::new("↻ Refresh devices").size(20.0)).clicked() { self.refresh_input_devices(); }
                     });
 
                 ui.add_space(6.0);
 
                 if is_active {
-                    if ui.add(egui::Button::new(egui::RichText::new("⏹ Stop").small().color(egui::Color32::from_rgb(255, 120, 80)))).clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("⏹ Stop").size(20.0).color(egui::Color32::from_rgb(255, 120, 80)))).clicked() {
                         self.stop_recording(rec_idx);
                     }
                 } else {
                     let can_rec = { let tracks = self.rec_tracks.read(); tracks.get(rec_idx).and_then(|t| t.device_label.as_ref()).is_some() };
                     let already_busy = self.rec_manager.is_recording();
                     if ui.add_enabled(can_rec && !already_busy, egui::Button::new(
-                        egui::RichText::new("🔴 Rec").small().color(
+                        egui::RichText::new("🔴 Rec").size(20.0).color(
                             if can_rec && !already_busy { egui::Color32::from_rgb(255, 60, 60) } else { egui::Color32::from_gray(65) }
                         )
                     )).on_hover_text(if already_busy { "Stop the current recording first" }
@@ -648,13 +648,13 @@ impl AppState {
 
                 if has_asset {
                     ui.add_space(4.0);
-                    if ui.add(egui::Button::new(egui::RichText::new("→ Drum Track").small().color(egui::Color32::from_rgb(80, 200, 130))))
+                    if ui.add(egui::Button::new(egui::RichText::new("→ Drum Track").size(20.0).color(egui::Color32::from_rgb(80, 200, 130))))
                         .on_hover_text("Promote this recording to a full drum track").clicked() {
                         self.promote_rec_to_drum(rec_idx);
                         return;
                     }
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(format!("take {} · {}", take_num - 1, dur_str)).small().color(egui::Color32::from_gray(75)));
+                    ui.label(egui::RichText::new(format!("take {} · {}", take_num - 1, dur_str)).size(20.0).color(egui::Color32::from_gray(75)));
                 }
             });
 
@@ -703,7 +703,7 @@ impl AppState {
                         for s in g.iter_mut() { s.clear(); }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new("Click cell to toggle  ·  Rows = chops").small().color(egui::Color32::from_gray(95)));
+                        ui.label(egui::RichText::new("Click cell to toggle  ·  Rows = chops").size(20.0).color(egui::Color32::from_gray(95)));
                     });
                 });
                 ui.separator();

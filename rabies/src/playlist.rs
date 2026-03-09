@@ -30,7 +30,7 @@ impl PlaylistEntry {
 pub struct SongEditor {
     pub patterns: RwLock<Vec<Pattern>>,
     /// `arrangement[row][bar]`
-    pub arrangement: RwLock<Vec<Vec<bool>>>,
+    pub arrangement: RwLock<Vec<Vec<Option<usize>>>>,
     pub total_bars:  RwLock<usize>,
 
     pub is_playing:          AtomicBool,
@@ -49,7 +49,7 @@ impl SongEditor {
     pub fn new() -> Self {
         let mut patterns = Vec::new();
         patterns.push(Pattern::empty(0));
-        let arrangement = vec![vec![false; Self::DEFAULT_BARS]];
+        let arrangement = vec![vec![None; Self::DEFAULT_BARS]];
         Self {
             patterns:             RwLock::new(patterns),
             arrangement:          RwLock::new(arrangement),
@@ -71,7 +71,7 @@ impl SongEditor {
         let total = *self.total_bars.read();
 
         self.patterns.write().push(Pattern::empty(id));
-        self.arrangement.write().push(vec![false; total]);
+       self.arrangement.write().push(vec![None; total]);
 
         self.patterns.read().len() - 1
     }
@@ -135,16 +135,18 @@ impl SongEditor {
 
     // ── arrangement ────────────────────────────────────────────────────────
 
+    // AFTER:
     pub fn toggle_block(&self, row: usize, bar: usize) {
         self.ensure_bar_count(bar + 1);
         let mut arr = self.arrangement.write();
         self.ensure_row(&mut arr, row);
         if let Some(r) = arr.get_mut(row) {
-            if let Some(cell) = r.get_mut(bar) { *cell = !*cell; }
+            if let Some(cell) = r.get_mut(bar) {
+                *cell = if cell.is_some() { None } else { Some(row) };
+            }
         }
     }
-
-    pub fn set_block(&self, row: usize, bar: usize, val: bool) {
+   pub fn set_block(&self, row: usize, bar: usize, val: Option<usize>) {
         self.ensure_bar_count(bar + 1);
         let mut arr = self.arrangement.write();
         self.ensure_row(&mut arr, row);
@@ -153,21 +155,21 @@ impl SongEditor {
         }
     }
 
-    pub fn get_block(&self, row: usize, bar: usize) -> bool {
+    pub fn get_block(&self, row: usize, bar: usize) -> Option<usize> {
         self.arrangement.read()
             .get(row)
             .and_then(|r| r.get(bar))
             .copied()
-            .unwrap_or(false)
+            .flatten()
     }
 
     pub fn clear_arrangement(&self) {
         for row in self.arrangement.write().iter_mut() {
-            for cell in row.iter_mut() { *cell = false; }
+           for cell in row.iter_mut() { *cell = None; }
         }
     }
 
-    pub fn get_arrangement_snapshot(&self) -> Vec<Vec<bool>> {
+   pub fn get_arrangement_snapshot(&self) -> Vec<Vec<Option<usize>>> {
         self.arrangement.read().clone()
     }
 
@@ -176,15 +178,15 @@ impl SongEditor {
         if min > cur {
             *self.total_bars.write() = min;
             for row in self.arrangement.write().iter_mut() {
-                while row.len() < min { row.push(false); }
+                while row.len() < min { row.push(None); }
             }
         }
     }
 
-    fn ensure_row(&self, arr: &mut Vec<Vec<bool>>, row: usize) {
+    fn ensure_row(&self, arr: &mut Vec<Vec<Option<usize>>>, row: usize) {
         let total = *self.total_bars.read();
         while arr.len() <= row {
-            arr.push(vec![false; total]);
+            arr.push(vec![None; total]);
         }
     }
 
@@ -202,13 +204,12 @@ impl SongEditor {
         self.current_step_in_bar.store(0, Ordering::Relaxed);
     }
 
-    pub fn is_playing(&self) -> bool { self.is_playing.load(Ordering::Relaxed) }
 
     /// Called once per sequencer tick.
     /// Returns the row-indices whose patterns should play this tick,
     /// plus the current bar index and step-within-bar.
     pub fn advance_song(&self) -> (Vec<usize>, usize, usize) {
-        if !self.is_playing() {
+        if !self.is_playing.load(Ordering::Relaxed) {
             let bar  = self.current_bar.load(Ordering::Relaxed);
             let step = self.current_step_in_bar.load(Ordering::Relaxed);
             return (vec![], bar, step);
@@ -226,9 +227,8 @@ impl SongEditor {
         }
 
         let arr     = self.arrangement.read();
-        let active  = arr.iter().enumerate()
-            .filter(|(_, row)| row.get(bar).copied().unwrap_or(false))
-            .map(|(i, _)| i)
+        let active = arr.iter()
+            .filter_map(|row| row.get(bar).copied().flatten())
             .collect();
 
         (active, bar, step)

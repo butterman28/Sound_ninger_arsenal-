@@ -42,7 +42,7 @@ fn fl_accent()          -> egui::Color32 { egui::Color32::from_rgb(100, 180, 255
 
 impl AppState {
     // =========================================================================
-    //  Song Editor  (original paint/erase view — unchanged)
+    //  Song Editor  (original paint/erase view)
     // =========================================================================
     pub fn draw_song_editor(&mut self, ui: &mut egui::Ui) {
         let open = self.song_editor_open.load(Ordering::Relaxed);
@@ -60,7 +60,7 @@ impl AppState {
                     .small().strong().color(egui::Color32::from_rgb(100, 149, 237)));
                 ui.separator();
 
-                let song_playing = self.song_editor.is_playing();
+                let song_playing = self.song_editor.is_playing.load(Ordering::Relaxed);
                 let (lbl, col) = if song_playing {
                     ("⏹ Stop Song", egui::Color32::from_rgb(220, 80, 60))
                 } else {
@@ -135,7 +135,7 @@ impl AppState {
                             egui::Stroke::new(if bar % 4 == 0 { 0.8 } else { 0.3 }, egui::Color32::from_gray(45)));
                     }
 
-                    if self.song_editor.is_playing() {
+                    if self.song_editor.is_playing.load(Ordering::Relaxed) {
                         let cur_bar = self.song_editor.current_bar.load(Ordering::Relaxed);
                         let px = grid_orig.x + cur_bar as f32 * BAR_W;
                         p.rect_filled(
@@ -206,8 +206,9 @@ impl AppState {
                         for bar in 0..total_bars {
                             let x    = grid_orig.x + bar as f32 * BAR_W;
                             let cell = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(BAR_W - 1.0, ROW_H - 1.0));
-                            let occupied = row_arr.and_then(|r| r.get(bar)).copied().unwrap_or(false);
-                            if occupied {
+                            // FIX: get_arrangement_snapshot returns Vec<Vec<Option<usize>>>
+                            let occupied = row_arr.and_then(|r| r.get(bar)).copied().flatten();
+                            if occupied.is_some() {
                                 p.rect_filled(cell.shrink(2.0), 3.0, color);
                                 p.hline(
                                     egui::Rangef::new(cell.shrink(2.0).left() + 2.0, cell.shrink(2.0).right() - 2.0),
@@ -236,8 +237,9 @@ impl AppState {
                                 let row_i = ((pos.y - grid_orig.y) / ROW_H) as usize;
                                 let bar   = bar.min(total_bars.saturating_sub(1));
                                 let row_i = row_i.min(n_patterns.saturating_sub(1));
-                                if primary   { self.song_editor.set_block(row_i, bar, true); }
-                                if secondary { self.song_editor.set_block(row_i, bar, false); }
+                                // FIX: set_block takes Option<usize>
+                                if primary   { self.song_editor.set_block(row_i, bar, Some(row_i)); }
+                                if secondary { self.song_editor.set_block(row_i, bar, None); }
                             }
                         }
                     }
@@ -252,11 +254,6 @@ impl AppState {
 
     // =========================================================================
     //  FL Studio–faithful Playlist
-    //
-    //  Key fix: everything (sidebar + grid) is drawn inside ONE ScrollArea
-    //  using a single allocated rect + painter. The sidebar occupies the
-    //  left FL_SIDEBAR_W pixels; the track grid occupies the rest.
-    //  This avoids nested layout containers fighting each other.
     // =========================================================================
     pub fn draw_fl_playlist(&mut self, ui: &mut egui::Ui) {
         let open = self.playlist_view_open.load(Ordering::Relaxed);
@@ -276,7 +273,7 @@ impl AppState {
         }
 
         let active_edit  = self.song_editor.active_edit_idx();
-        let song_playing = self.song_editor.is_playing();
+        let song_playing = self.song_editor.is_playing.load(Ordering::Relaxed);
 
         let outer_frame = egui::Frame::none()
             .fill(fl_toolbar_bg())
@@ -337,17 +334,6 @@ impl AppState {
 
             ui.add(egui::Separator::default().horizontal().spacing(0.0));
 
-            // ── BODY: single ScrollArea, painter draws sidebar + grid ────
-            //
-            //  Content layout (x axis):
-            //    [0 .. FL_SIDEBAR_W)           = pattern sidebar
-            //    [FL_SIDEBAR_W .. +FL_TRACK_LBL) = "Track N" label column
-            //    [FL_SIDEBAR_W+FL_TRACK_LBL ..) = bar grid
-            //
-            //  Content layout (y axis):
-            //    [0 .. FL_HEADER_H)            = header row (bar numbers / column labels)
-            //    [FL_HEADER_H .. )              = track rows
-
             let grid_total_w = FL_BAR_W * total_bars as f32;
             let content_w    = FL_SIDEBAR_W + FL_TRACK_LBL + grid_total_w + 8.0;
             let content_h    = FL_HEADER_H + FL_TRACK_H * n_tracks as f32 + 4.0;
@@ -372,7 +358,6 @@ impl AppState {
                 );
                 p.rect_filled(sidebar_rect, 0.0, fl_sidebar_bg());
 
-                // Sidebar header
                 let sb_hdr = egui::Rect::from_min_size(outer.min, egui::vec2(FL_SIDEBAR_W, FL_HEADER_H));
                 p.rect_filled(sb_hdr, 0.0, fl_toolbar_bg());
                 p.hline(sb_hdr.x_range(), sb_hdr.bottom(), egui::Stroke::new(0.7, fl_border()));
@@ -384,14 +369,13 @@ impl AppState {
                     );
                 }
 
-                // Sidebar right border (vertical divider)
                 p.vline(
                     sidebar_rect.right(),
                     egui::Rangef::new(outer.top(), outer.bottom()),
                     egui::Stroke::new(1.0, fl_border()),
                 );
 
-                // ── Pattern rows in sidebar (vertical list) ───────────────
+                // ── Pattern rows in sidebar ───────────────────────────────
                 let item_h = 24.0_f32;
                 for row_i in 0..n_patterns {
                     let pattern = match self.song_editor.get_pattern_by_idx(row_i) {
@@ -400,7 +384,6 @@ impl AppState {
                     let color     = pattern.egui_color();
                     let is_active = row_i == active_edit;
 
-                    // Each item sits below the sidebar header, stacked vertically
                     let y = outer.top() + FL_HEADER_H + row_i as f32 * item_h;
                     let item_rect = egui::Rect::from_min_size(
                         egui::pos2(outer.left(), y),
@@ -410,7 +393,6 @@ impl AppState {
                     let item_bg = if is_active { fl_selected_pat_bg() } else { fl_sidebar_bg() };
                     p.rect_filled(item_rect, 0.0, item_bg);
 
-                    // Active indicator ▸
                     if is_active {
                         p.text(
                             egui::pos2(item_rect.left() + 4.0, item_rect.center().y),
@@ -419,7 +401,6 @@ impl AppState {
                         );
                     }
 
-                    // Pattern name
                     let name = if pattern.name.len() > 14 {
                         format!("{}…", &pattern.name[..12])
                     } else { pattern.name.clone() };
@@ -430,17 +411,14 @@ impl AppState {
                         if is_active { egui::Color32::WHITE } else { fl_text() },
                     );
 
-                    // Coloured dot on the right
                     let dot_x = item_rect.right() - 11.0;
                     p.circle_filled(egui::pos2(dot_x, item_rect.center().y), 4.5, color);
                     p.circle_stroke(egui::pos2(dot_x, item_rect.center().y), 4.5,
                         egui::Stroke::new(0.8, egui::Color32::from_rgba_unmultiplied(255,255,255,50)));
 
-                    // Bottom divider
                     p.hline(item_rect.x_range(), item_rect.bottom(),
                         egui::Stroke::new(0.5, fl_border()));
 
-                    // Interaction (hover highlight + click)
                     let resp = ui.interact(item_rect, egui::Id::new("fl_sb4").with(row_i), egui::Sense::click());
                     if resp.hovered() && !is_active {
                         p.rect_filled(item_rect, 0.0,
@@ -465,23 +443,19 @@ impl AppState {
                 }
 
                 // ── Grid area ──────────────────────────────────────────────
-                // X-offset of the track-label column inside the grid region
-                let grid_x0   = outer.left() + FL_SIDEBAR_W;         // start of track-label col
+                let grid_x0   = outer.left() + FL_SIDEBAR_W;
                 let grid_orig = egui::pos2(grid_x0 + FL_TRACK_LBL, outer.top() + FL_HEADER_H);
 
-                // Header background (track label + bar numbers)
                 let hdr_rect = egui::Rect::from_min_size(
                     egui::pos2(grid_x0, outer.top()),
                     egui::vec2(FL_TRACK_LBL + grid_total_w, FL_HEADER_H),
                 );
                 p.rect_filled(hdr_rect, 0.0, fl_header_bg());
-                // "Track" column label
                 p.text(
                     egui::pos2(grid_x0 + FL_TRACK_LBL * 0.5, outer.top() + FL_HEADER_H * 0.5),
                     egui::Align2::CENTER_CENTER, "Track",
                     egui::FontId::monospace(8.5), fl_text_dim(),
                 );
-                // Bar numbers
                 for bar in 0..total_bars {
                     let x = grid_orig.x + bar as f32 * FL_BAR_W;
                     if bar % 2 == 0 {
@@ -540,7 +514,6 @@ impl AppState {
                     let y = grid_orig.y + track_i as f32 * FL_TRACK_H;
                     let track_bg = if track_i % 2 == 0 { fl_track_even() } else { fl_track_odd() };
 
-                    // Track label cell
                     let label_cell = egui::Rect::from_min_size(
                         egui::pos2(grid_x0, y),
                         egui::vec2(FL_TRACK_LBL - 1.0, FL_TRACK_H - 1.0),
@@ -565,27 +538,35 @@ impl AppState {
                         egui::Rangef::new(y, y + FL_TRACK_H - 1.0),
                         egui::Stroke::new(1.0, fl_border()));
 
-                    // Row background
                     p.rect_filled(
                         egui::Rect::from_min_size(egui::pos2(grid_orig.x, y), egui::vec2(grid_total_w, FL_TRACK_H - 1.0)),
                         0.0, track_bg,
                     );
 
-                    // Bar cells
                     let row_arr = arr.get(track_i);
                     for bar in 0..total_bars {
                         let x    = grid_orig.x + bar as f32 * FL_BAR_W;
                         let cell = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(FL_BAR_W - 1.0, FL_TRACK_H - 1.0));
-                        let occupied    = row_arr.and_then(|r| r.get(bar)).copied().unwrap_or(false);
+                        // FIX: arrangement stores Option<usize>
+                        let occupied    = row_arr.and_then(|r| r.get(bar)).copied().flatten();
                         let is_drag_src = drag_src == Some((track_i, bar));
                         let is_hover    = hover_cell == Some((track_i, bar));
                         let is_ghost    = is_hover && drag_src.is_some();
 
                         let pat_idx = active_edit.min(n_patterns.saturating_sub(1));
-                        let cell_color = if n_patterns > 0 {
-                            self.song_editor.get_pattern_by_idx(pat_idx)
-                                .map(|pat| pat.egui_color()).unwrap_or(fl_accent())
-                        } else { fl_accent() };
+                        let cell_color = if let Some(placed_idx) = occupied {
+                            self.song_editor
+                                .get_pattern_by_idx(placed_idx)
+                                .map(|pat| pat.egui_color())
+                                .unwrap_or(fl_accent())
+                        } else {
+                            // For hover preview ghost, use the active brush pattern
+                            let pat_idx = active_edit.min(n_patterns.saturating_sub(1));
+                            self.song_editor
+                                .get_pattern_by_idx(pat_idx)
+                                .map(|pat| pat.egui_color())
+                                .unwrap_or(fl_accent())
+                        };
 
                         if is_drag_src {
                             p.rect_stroke(cell.shrink(2.0), 2.0,
@@ -595,7 +576,7 @@ impl AppState {
                             p.rect_filled(cell.shrink(1.5), 3.0,
                                 egui::Color32::from_rgba_unmultiplied(cell_color.r(), cell_color.g(), cell_color.b(), 130));
                             p.rect_stroke(cell.shrink(1.5), 3.0, egui::Stroke::new(2.0, cell_color));
-                        } else if occupied {
+                        } else if occupied.is_some() {
                             p.rect_filled(cell.shrink(1.0), 2.0, cell_color);
                             p.hline(
                                 egui::Rangef::new(cell.shrink(2.0).left(), cell.shrink(2.0).right()),
@@ -619,13 +600,11 @@ impl AppState {
                                 egui::Color32::from_rgba_unmultiplied(cell_color.r(), cell_color.g(), cell_color.b(), 50));
                         }
 
-                        // Grid lines
                         let gl = if bar % 4 == 0 { fl_grid_major() } else { fl_grid_minor() };
                         p.vline(x, egui::Rangef::new(y, y + FL_TRACK_H - 1.0),
                             egui::Stroke::new(if bar % 4 == 0 { 0.8 } else { 0.4 }, gl));
                     }
 
-                    // Row divider
                     p.hline(
                         egui::Rangef::new(grid_x0, grid_x0 + FL_TRACK_LBL + grid_total_w),
                         y + FL_TRACK_H - 0.5,
@@ -645,19 +624,22 @@ impl AppState {
 
                 if primary_pressed {
                     if let Some((ti, bar)) = hover_cell {
-                        let occupied = arr.get(ti).and_then(|r| r.get(bar)).copied().unwrap_or(false);
-                        if occupied {
-                            self.song_editor.set_block(ti, bar, false);
+                        // FIX: get_block returns Option<usize>
+                        let occupied = arr.get(ti).and_then(|r| r.get(bar)).copied().flatten();
+                        if occupied.is_some() {
+                            // FIX: set_block takes Option<usize>
+                            self.song_editor.set_block(ti, bar, None);
                             *self.pl_drag_src.write() = Some((ti, bar));
                         } else {
-                            self.song_editor.set_block(ti, bar, true);
+                            self.song_editor.set_block(ti, bar, Some(ti));
                         }
                     }
                 }
                 if primary_down && drag_src.is_none() && gresp.dragged() {
                     if let Some((ti, bar)) = hover_cell {
-                        if !self.song_editor.get_block(ti, bar) {
-                            self.song_editor.set_block(ti, bar, true);
+                        // FIX: get_block returns Option<usize>
+                        if self.song_editor.get_block(ti, bar).is_none() {
+                            self.song_editor.set_block(ti, bar, Some(ti));
                         }
                     }
                 }
@@ -665,17 +647,19 @@ impl AppState {
                     let held = *self.pl_drag_src.read();
                     if let Some((src_ti, src_bar)) = held {
                         let target = hover_cell.unwrap_or((src_ti, src_bar));
-                        self.song_editor.set_block(target.0, target.1, true);
+                        // FIX: set_block takes Option<usize>
+                        self.song_editor.set_block(target.0, target.1, Some(target.0));
                         *self.pl_drag_src.write() = None;
                     }
                 }
                 if secondary_down && (gresp.dragged() || gresp.secondary_clicked() || gresp.clicked()) {
                     if let Some((ti, bar)) = hover_cell {
-                        self.song_editor.set_block(ti, bar, false);
+                        // FIX: set_block takes Option<usize>
+                        self.song_editor.set_block(ti, bar, None);
                     }
                     let held = *self.pl_drag_src.read();
                     if let Some((src_ti, src_bar)) = held {
-                        self.song_editor.set_block(src_ti, src_bar, true);
+                        self.song_editor.set_block(src_ti, src_bar, Some(src_ti));
                         *self.pl_drag_src.write() = None;
                     }
                 }
@@ -685,14 +669,15 @@ impl AppState {
                 if drag_now.is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 } else if let Some((ti, bar)) = hover_cell {
-                    if self.song_editor.get_block(ti, bar) {
+                    // FIX: get_block returns Option<usize>
+                    if self.song_editor.get_block(ti, bar).is_some() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                     } else {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                     }
                 }
-            }); // end ScrollArea
-
+            }
+        ); // end ScrollArea
             // ── Status bar ────────────────────────────────────────────────
             ui.add(egui::Separator::default().horizontal().spacing(0.0));
             ui.horizontal(|ui| {
@@ -711,14 +696,14 @@ impl AppState {
     }
 
     // =========================================================================
-    //  Pattern-tab bar  (inside step-sequencer header — unchanged)
+    //  Pattern-tab bar  (inside step-sequencer header)
     // =========================================================================
     pub fn draw_pattern_tabs(&mut self, ui: &mut egui::Ui) {
         let n      = self.song_editor.pattern_count();
         let active = self.song_editor.active_edit_idx();
 
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("PAT").small().color(egui::Color32::from_gray(80)));
+            ui.label(egui::RichText::new("PAT").size(20.0).color(egui::Color32::from_gray(80)));
             ui.add_space(2.0);
 
             for i in 0..n {
@@ -730,7 +715,7 @@ impl AppState {
 
                 let lbl  = if pattern.name.len() > 8 { format!("{}…", &pattern.name[..6]) } else { pattern.name.clone() };
                 let rich  = egui::RichText::new(&lbl)
-                    .small()
+                    .size(20.0)
                     .color(if is_active { color } else { egui::Color32::from_gray(120) });
                 let btn = egui::Button::new(rich)
                     .fill(if is_active {
@@ -745,7 +730,7 @@ impl AppState {
                 if resp.clicked() && !is_active { self.switch_pattern(i); }
                 resp.context_menu(|ui| {
                     ui.set_min_width(130.0);
-                    ui.label(egui::RichText::new(&pattern.name).small().color(color));
+                    ui.label(egui::RichText::new(&pattern.name).size(20.0).color(color));
                     ui.separator();
                     if ui.button("⎘ Duplicate").clicked() {
                         self.song_editor.duplicate_pattern(i); ui.close_menu();
@@ -766,7 +751,7 @@ impl AppState {
             }
 
             if ui.add(
-                egui::Button::new(egui::RichText::new("＋").small().color(egui::Color32::from_rgb(80, 220, 140)))
+                egui::Button::new(egui::RichText::new("+").size(20.0).color(egui::Color32::from_rgb(80, 220, 140)))
                     .fill(egui::Color32::from_rgb(18, 28, 20))
                     .stroke(egui::Stroke::new(0.8, egui::Color32::from_rgb(50, 130, 70)))
             ).on_hover_text("Create new pattern (fresh workspace)").clicked() {
