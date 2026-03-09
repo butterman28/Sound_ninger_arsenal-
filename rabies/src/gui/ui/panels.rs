@@ -8,12 +8,10 @@ use crate::recording::RecordState;
 
 impl AppState {
     pub fn seq_header_ui(&mut self, ui: &mut egui::Ui) {
-        // ── Row 1 – Pattern tabs ───────────────────────────────────────────
         ui.horizontal(|ui| {
-            self.draw_pattern_tabs(ui);     // defined in pattern_playlist.rs
+            self.draw_pattern_tabs(ui);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // ── FL Playlist toggle ────────────────────────────────────
                 let pl_open = self.playlist_view_open.load(std::sync::atomic::Ordering::Relaxed);
                 let (pl_lbl, pl_col) = if pl_open {
                     ("🎛 Playlist ▲", egui::Color32::from_rgb(237, 164, 80))
@@ -30,7 +28,6 @@ impl AppState {
                     self.playlist_view_open.store(!pl_open, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                // ── Song Editor toggle ────────────────────────────────────
                 let open      = self.song_editor_open.load(std::sync::atomic::Ordering::Relaxed);
                 let (lbl, col) = if open {
                     ("📋 Song ▲", egui::Color32::from_rgb(100, 149, 237))
@@ -51,7 +48,6 @@ impl AppState {
 
         ui.add(egui::Separator::default().horizontal().spacing(3.0));
 
-        // ── Row 2 – Transport / Add Track (original seq header content) ───
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("STEP SEQUENCER").size(20.0).strong().color(egui::Color32::from_gray(100)));
             ui.separator();
@@ -86,8 +82,6 @@ impl AppState {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // ← Add Track is now the leftmost button in the right group
-                //   so it's right next to the Song Editor toggle above.
                 if ui.add(egui::Button::new(
                     egui::RichText::new("＋ Add Track").size(20.0).color(egui::Color32::from_rgb(80,220,140))
                 )).clicked() {
@@ -128,6 +122,11 @@ impl AppState {
             let current_step = *self.seq_current_step.read();
             let seq_playing  = self.seq_playing.load(Ordering::Relaxed);
 
+            // ── Deferred mutation targets – set inside the scroll area,
+            //    applied after it closes to avoid mid-loop structural changes.
+            let mut track_to_remove: Option<usize> = None;
+            let mut chop_to_remove:  Option<(usize, usize)> = None;
+
             egui::ScrollArea::vertical()
                 .id_source("seq_body_scroll")
                 .auto_shrink([false, true])
@@ -161,7 +160,6 @@ impl AppState {
                     let color     = drum_color(drum_idx);
                     let color_dim = drum_color_dim(drum_idx);
 
-                    // ✅ Extract sample_uuid alongside other track info
                     let (file_name, time_str, muted, sample_uuid) = {
                         let tracks = self.drum_tracks.read();
                         let t = &tracks[drum_idx];
@@ -169,13 +167,12 @@ impl AppState {
                             t.asset.file_name.clone(),
                             format!("{:.2}s", t.asset.frames as f32 / t.asset.sample_rate as f32),
                             t.muted,
-                            t.sample_uuid,  // ✅ track's UUID, not filename
+                            t.sample_uuid,
                         )
                     };
                     let is_focused = matches!(self.waveform_focus.read().clone(),
                         WaveformFocus::DrumTrack(i) if i == drum_idx);
 
-                    // ✅ Look up chops by UUID — never bleed across same-name tracks
                     let chop_marks = self.samples_manager.get_marks_for_sample(&sample_uuid);
                     let has_chops  = !chop_marks.is_empty();
 
@@ -186,7 +183,7 @@ impl AppState {
                         }
                     }
 
-                    // Main track step row + ADSR
+                    // ── Main track step row ──────────────────────────────────
                     {
                         let steps = {
                             let tracks = self.drum_tracks.read();
@@ -223,6 +220,21 @@ impl AppState {
                                     if let Some(t) = self.drum_tracks.write().get_mut(drum_idx) { t.steps[step] = !t.steps[step]; }
                                 }
                             );
+
+                            // ── ✕ Remove track (+ all its chops) ────────────
+                            if ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new("X").size(13.0)
+                                        .color(egui::Color32::from_rgb(200, 70, 70))
+                                )
+                                .min_size(egui::vec2(26.0, row_h))
+                                .fill(egui::Color32::from_rgb(38, 12, 12))
+                            )
+                            .on_hover_text("Remove track and all its chops")
+                            .clicked()
+                            {
+                                track_to_remove = Some(drum_idx);
+                            }
                         });
 
                         ui.horizontal(|ui| {
@@ -253,7 +265,7 @@ impl AppState {
                         });
                     }
 
-                    // Chop rows
+                    // ── Chop rows ────────────────────────────────────────────
                     if has_chops {
                         for (chop_idx, mark) in chop_marks.iter().enumerate() {
                             let chop_color     = pad_color(chop_idx);
@@ -336,6 +348,21 @@ impl AppState {
                                         }
                                     },
                                 );
+
+                                // ── ✕ Remove this chop ───────────────────────
+                                if ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("X").size(11.0)
+                                            .color(egui::Color32::from_rgb(180, 60, 60))
+                                    )
+                                    .min_size(egui::vec2(22.0, row_h))
+                                    .fill(egui::Color32::from_rgb(32, 10, 10))
+                                )
+                                .on_hover_text("Remove this chop marker")
+                                .clicked()
+                                {
+                                    chop_to_remove = Some((drum_idx, chop_idx));
+                                }
                             });
 
                             // Per-chop ADSR row
@@ -384,7 +411,6 @@ impl AppState {
                                 }
 
                                 {
-                                    // ✅ Use sample_uuid for "ToMarker" dropdown too
                                     let all_marks = self.samples_manager.get_marks_for_sample(&sample_uuid);
                                     let is_to_marker = matches!(play_mode, crate::gui::ChopPlayMode::ToMarker(_));
                                     let current_target_id: Option<usize> = if let crate::gui::ChopPlayMode::ToMarker(id) = play_mode { Some(id) } else { None };
@@ -469,10 +495,64 @@ impl AppState {
                 }
                 ui.add_space(3.0);
                 ui.label(egui::RichText::new(
-                    "Click steps to toggle  ·  Click label to focus/preview  ·  Right-click for options  ·  Drag knobs to shape ADSR")
+                    "Click steps to toggle  ·  Click label to focus/preview  ·  Right-click for options  ·  X to remove")
                     .size(20.0).color(egui::Color32::from_gray(58)));
 
                 });
+
+            // ── Apply deferred track removal ──────────────────────────────────
+            if let Some(rm_idx) = track_to_remove {
+                let uuid = self.drum_tracks.read().get(rm_idx).map(|t| t.sample_uuid);
+                if let Some(uuid) = uuid {
+                    self.samples_manager.clear_marks_for_uuid(&uuid);
+                }
+                self.drum_tracks.write().remove(rm_idx);
+                let n = self.drum_tracks.read().len();
+                if n == 0 {
+                    *self.waveform_focus.write()    = WaveformFocus::MainSample;
+                    *self.main_track_index.write()  = None;
+                    *self.waveform_analysis.write() = None;
+                } else {
+                    let new_idx = rm_idx.min(n - 1);
+                    *self.waveform_focus.write() = WaveformFocus::DrumTrack(new_idx);
+                    let cur_main = *self.main_track_index.read();
+                    if cur_main.map_or(true, |i| i == rm_idx || i >= n) {
+                        *self.main_track_index.write() = Some(new_idx);
+                    }
+                    if let Some(wf) = self.drum_tracks.read().get(new_idx).and_then(|t| t.waveform.clone()) {
+                        *self.waveform_analysis.write() = Some(wf);
+                    }
+                }
+                *self.status.write() = format!("Track {} removed", rm_idx + 1);
+            }
+
+            // ── Apply deferred chop removal ───────────────────────────────────
+            if let Some((t_idx, c_idx)) = chop_to_remove {
+                let uuid = self.drum_tracks.read().get(t_idx).map(|t| t.sample_uuid);
+                if let Some(uuid) = uuid {
+                    // Find and delete the mark from the global marks list
+                    let marks = self.samples_manager.get_marks_for_sample(&uuid);
+                    if let Some(mark) = marks.get(c_idx) {
+                        let mark_id = mark.id;
+                        let global_idx = self.samples_manager.get_marks()
+                            .iter()
+                            .position(|m| m.id == mark_id);
+                        if let Some(gi) = global_idx {
+                            self.samples_manager.delete_mark(gi);
+                        }
+                    }
+                }
+                // Remove corresponding per-chop arrays at that index
+                let mut tracks = self.drum_tracks.write();
+                if let Some(t) = tracks.get_mut(t_idx) {
+                    if c_idx < t.chop_steps.len()       { t.chop_steps.remove(c_idx); }
+                    if c_idx < t.chop_adsr.len()        { t.chop_adsr.remove(c_idx); }
+                    if c_idx < t.chop_adsr_enabled.len(){ t.chop_adsr_enabled.remove(c_idx); }
+                    if c_idx < t.chop_play_modes.len()  { t.chop_play_modes.remove(c_idx); }
+                    if c_idx < t.chop_piano_notes.len() { t.chop_piano_notes.remove(c_idx); }
+                }
+                *self.status.write() = format!("Chop {} removed", c_idx + 1);
+            }
         });
     }
 
@@ -672,11 +752,10 @@ impl AppState {
             (
                 track.asset.file_name.clone(),
                 track.asset.frames as f32 / track.asset.sample_rate as f32,
-                track.sample_uuid,  // ✅ UUID for this track instance
+                track.sample_uuid,
             )
         };
         let main_idx = *self.main_track_index.read();
-        // ✅ Use UUID — not filename — to look up this track's chops only
         let marks = self.samples_manager.get_marks_for_sample(&sample_uuid);
 
         let mut window_open = true;

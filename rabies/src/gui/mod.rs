@@ -1,4 +1,5 @@
 // src/gui/mod.rs
+use crate::playlist::PlaylistAudioTrack;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -78,14 +79,15 @@ pub enum WaveformFocus {
 
 pub struct AppState {
     // ── Song editor ────────────────────────────────────────────────────────
-    pub song_editor:        Arc<SongEditor>,
-    pub song_editor_open:   Arc<AtomicBool>,
-    /// FL-style Playlist view (drag blocks to move them)
-    pub playlist_view_open: Arc<AtomicBool>,
-    /// Drag state for FL Playlist: (row, bar) of the block currently being dragged
-    pub pl_drag_src:        Arc<RwLock<Option<(usize, usize)>>>,
+    pub song_editor:           Arc<SongEditor>,
+    pub song_editor_open:      Arc<AtomicBool>,
+    pub playlist_view_open:    Arc<AtomicBool>,
+    /// Drag-move source: (pattern_row, bar) held while dragging a pattern block.
+    pub pl_drag_src:           Arc<RwLock<Option<(usize, usize)>>>,
+    /// Audio tracks in the FL playlist arrangement view.
+    pub playlist_audio_tracks: Arc<RwLock<Vec<PlaylistAudioTrack>>>,
     /// Asset pool: file_path → loaded AudioAsset (PCM only, for fast pattern switching)
-    pub asset_pool: Arc<RwLock<HashMap<String, Arc<AudioAsset>>>>,
+    pub asset_pool:            Arc<RwLock<HashMap<String, Arc<AudioAsset>>>>,
 
     // ── Audio ─────────────────────────────────────────────────────────────
     pub audio_manager:    Arc<AudioManager>,
@@ -135,18 +137,19 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            song_editor:        Arc::new(SongEditor::new()),
-            song_editor_open:   Arc::new(AtomicBool::new(false)),
-            playlist_view_open: Arc::new(AtomicBool::new(false)),
-            pl_drag_src:        Arc::new(RwLock::new(None)),
-            asset_pool:         Arc::new(RwLock::new(HashMap::new())),
+            song_editor:           Arc::new(SongEditor::new()),
+            song_editor_open:      Arc::new(AtomicBool::new(false)),
+            playlist_view_open:    Arc::new(AtomicBool::new(false)),
+            pl_drag_src:           Arc::new(RwLock::new(None)),
+            playlist_audio_tracks: Arc::new(RwLock::new(Vec::new())),
+            asset_pool:            Arc::new(RwLock::new(HashMap::new())),
 
-            audio_manager:    Arc::new(AudioManager::new()),
-            active_voices:    Arc::new(std::sync::Mutex::new(Vec::new())),
-            samples_manager:  Arc::new(SamplesManager::new()),
-            current_asset:    Arc::new(RwLock::new(None)),
-            waveform_analysis: Arc::new(RwLock::new(None)),
-            status:           Arc::new(RwLock::new("Click Load Sample to begin".to_string())),
+            audio_manager:         Arc::new(AudioManager::new()),
+            active_voices:         Arc::new(std::sync::Mutex::new(Vec::new())),
+            samples_manager:       Arc::new(SamplesManager::new()),
+            current_asset:         Arc::new(RwLock::new(None)),
+            waveform_analysis:     Arc::new(RwLock::new(None)),
+            status:                Arc::new(RwLock::new("Click Load Sample to begin".to_string())),
             playback_stop_target:  Arc::new(AtomicF32::new(-1.0)),
             playback_position:     Arc::new(AtomicF32::new(0.0)),
             is_playing:            Arc::new(AtomicBool::new(false)),
@@ -634,13 +637,60 @@ impl AppState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Sequencer tick
+//  Sequencer tick + song transport + playlist audio
 // ═══════════════════════════════════════════════════════════════════════════════
 impl AppState {
-    pub fn tick_sequencer(&self) {  
-    if self.song_editor.is_playing.load(Ordering::Relaxed) && self.seq_playing.load(Ordering::Relaxed) {
-            let bar     = self.song_editor.current_bar.load(Ordering::Relaxed);
-            let arr     = self.song_editor.get_arrangement_snapshot();
+    /// Append a new (empty) audio track row to the playlist.
+    pub fn add_playlist_audio_track(&self) {
+        let idx = self.playlist_audio_tracks.read().len();
+        self.playlist_audio_tracks.write().push(PlaylistAudioTrack::new(idx));
+        *self.status.write() = format!(
+            "Audio track {} added — double-click its label to load a file", idx + 1
+        );
+    }
+
+    /// Open a native file dialog, decode the file, and store its PCM + waveform
+    /// thumbnail in the playlist audio track at `track_idx`.
+    pub fn load_audio_into_playlist_track(&self, track_idx: usize) {
+        let path = match rfd::FileDialog::new()
+            .add_filter("Audio", &["wav","mp3","flac","ogg","aiff","aif","m4a"])
+            .set_title("Load Audio into Playlist Track")
+            .pick_file()
+        {
+            Some(p) => p,
+            None    => return,
+        };
+
+        let path_str = path.to_string_lossy().to_string();
+        let asset = match self.audio_manager.load_audio(&path_str) {
+            Ok(a)  => a,
+            Err(e) => { *self.status.write() = format!("Failed to load audio: {}", e); return; }
+        };
+
+        let waveform = self.audio_manager.analyze_waveform(&asset, 512);
+
+        let mut tracks = self.playlist_audio_tracks.write();
+        if let Some(t) = tracks.get_mut(track_idx) {
+            let stem = path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("audio")
+                .to_string();
+            t.name            = stem;
+            t.source_asset    = Some(asset.clone());
+            t.source_waveform = Some(waveform);
+        }
+
+        *self.status.write() = format!(
+            "Loaded \"{}\" into audio track {}",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+            track_idx + 1,
+        );
+    }
+
+    pub fn tick_sequencer(&self) {
+        if self.song_editor.is_playing.load(Ordering::Relaxed) && self.seq_playing.load(Ordering::Relaxed) {
+            let bar  = self.song_editor.current_bar.load(Ordering::Relaxed);
+            let arr  = self.song_editor.get_arrangement_snapshot();
             let first = arr.iter().enumerate()
                 .find(|(_, row)| row.get(bar).copied().flatten().is_some())
                 .map(|(i, _)| i);
@@ -672,10 +722,10 @@ impl AppState {
             cur
         };
 
-        
         if self.song_editor.is_playing.load(Ordering::Relaxed) {
             let _ = self.song_editor.advance_song();
         }
+
         let mut voices: Vec<Voice> = Vec::new();
 
         if let Some(asset) = self.current_asset.read().clone() {

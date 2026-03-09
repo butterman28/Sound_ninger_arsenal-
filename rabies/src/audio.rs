@@ -31,6 +31,32 @@ pub struct AudioManager {
     assets: RwLock<std::collections::HashMap<String, Arc<AudioAsset>>>,
 }
 
+impl WaveformAnalysis {
+    /// Build a waveform analysis with `n_buckets` min/max pairs from an asset.
+    pub fn from_asset(asset: &AudioAsset, n_buckets: usize) -> Self {
+        let samples  = &asset.pcm;                         // ← was asset.samples
+        let channels = asset.channels.max(1) as usize;
+        let frames   = asset.frames as usize;              // ← cast u64 → usize
+        let bkt      = (frames / n_buckets.max(1)).max(1); // ← now both usize
+        let mut buckets = Vec::with_capacity(n_buckets);
+
+        for b in 0..n_buckets {
+            let start = b * bkt * channels;
+            let end   = ((b + 1) * bkt * channels).min(samples.len());
+            if start >= samples.len() { break; }
+            let slice = &samples[start..end];
+            let (mut lo, mut hi) = (0.0_f32, 0.0_f32);
+            for &s in slice { lo = lo.min(s); hi = hi.max(s); }
+            buckets.push((lo, hi));
+        }
+        while buckets.len() < n_buckets { buckets.push((0.0, 0.0)); }
+
+        // ← removed the rms block; WaveformAnalysis has no rms field
+        WaveformAnalysis { min_max_buckets: buckets, sample_rate: asset.sample_rate }
+    }
+}
+
+
 impl AudioManager {
     pub fn new() -> Self {
         Self {
